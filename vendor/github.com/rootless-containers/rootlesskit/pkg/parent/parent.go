@@ -12,15 +12,16 @@ import (
 	"strconv"
 	"syscall"
 
-	"github.com/docker/docker/pkg/idtools"
 	"github.com/gorilla/mux"
 	"github.com/pkg/errors"
+	"github.com/sirupsen/logrus"
 	"github.com/theckman/go-flock"
 
 	"github.com/rootless-containers/rootlesskit/pkg/api/router"
 	"github.com/rootless-containers/rootlesskit/pkg/common"
 	"github.com/rootless-containers/rootlesskit/pkg/msgutil"
 	"github.com/rootless-containers/rootlesskit/pkg/network"
+	"github.com/rootless-containers/rootlesskit/pkg/parent/idtools"
 	"github.com/rootless-containers/rootlesskit/pkg/port"
 )
 
@@ -30,6 +31,8 @@ type Opt struct {
 	StateDirEnvKey string               // optional env key to propagate StateDir value
 	NetworkDriver  network.ParentDriver // nil for HostNetwork
 	PortDriver     port.ParentDriver    // nil for --port-driver=none
+	PublishPorts   []port.Spec
+	CreatePIDNS    bool
 }
 
 // Documented state files. Undocumented ones are subject to change.
@@ -85,6 +88,10 @@ func Parent(opt Opt) error {
 	if opt.NetworkDriver != nil {
 		cmd.SysProcAttr.Unshareflags |= syscall.CLONE_NEWNET
 	}
+	if opt.CreatePIDNS {
+		// cannot be Unshareflags (panics)
+		cmd.SysProcAttr.Cloneflags |= syscall.CLONE_NEWPID
+	}
 	cmd.Stdin = os.Stdin
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
@@ -95,10 +102,6 @@ func Parent(opt Opt) error {
 	}
 	if err := cmd.Start(); err != nil {
 		return errors.Wrap(err, "failed to start the child")
-	}
-	childPIDPath := filepath.Join(opt.StateDir, StateFileChildPID)
-	if err := ioutil.WriteFile(childPIDPath, []byte(strconv.Itoa(cmd.Process.Pid)), 0444); err != nil {
-		return errors.Wrapf(err, "failed to write the child PID %d to %s", cmd.Process.Pid, childPIDPath)
 	}
 	if err := setupUIDGIDMap(cmd.Process.Pid); err != nil {
 		return errors.Wrap(err, "failed to setup UID/GID map")
@@ -153,13 +156,27 @@ func Parent(opt Opt) error {
 	if err := pipeW.Close(); err != nil {
 		return err
 	}
-	// wait for port driver to be ready
 	if opt.PortDriver != nil {
+		// wait for port driver to be ready
 		select {
 		case <-portDriverInitComplete:
 		case err = <-portDriverErr:
 			return err
 		}
+		// publish ports
+		for _, p := range opt.PublishPorts {
+			st, err := opt.PortDriver.AddPort(context.TODO(), p)
+			if err != nil {
+				return errors.Wrapf(err, "failed to expose port %v", p)
+			}
+			logrus.Debugf("published port %v", st)
+		}
+	}
+
+	// after child is fully configured, write PID to child_pid file
+	childPIDPath := filepath.Join(opt.StateDir, StateFileChildPID)
+	if err := ioutil.WriteFile(childPIDPath, []byte(strconv.Itoa(cmd.Process.Pid)), 0444); err != nil {
+		return errors.Wrapf(err, "failed to write the child PID %d to %s", cmd.Process.Pid, childPIDPath)
 	}
 	// listens the API
 	apiSockPath := filepath.Join(opt.StateDir, StateFileAPISock)

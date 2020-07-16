@@ -36,7 +36,8 @@ func main() {
 	bc = &bindata.Config{
 		Input: []bindata.InputConfig{
 			{
-				Path: "manifests",
+				Path:      "manifests",
+				Recursive: true,
 			},
 		},
 		Package:    "deploy",
@@ -64,31 +65,12 @@ func main() {
 		logrus.Fatal(err)
 	}
 
-	bc = &bindata.Config{
-		Input: []bindata.InputConfig{
-			{
-				Path: "vendor/k8s.io/kubernetes/openapi.json",
-			},
-			{
-				Path: "vendor/k8s.io/kubernetes/openapi.pb",
-			},
-		},
-		Package:    "openapi",
-		NoMetadata: true,
-		Prefix:     "vendor/k8s.io/kubernetes/",
-		Output:     "pkg/openapi/zz_generated_bindata.go",
-	}
-	if err := bindata.Translate(bc); err != nil {
-		logrus.Fatal(err)
-	}
-
 	controllergen.Run(args.Options{
 		OutputPackage: "github.com/rancher/k3s/pkg/generated",
 		Boilerplate:   "scripts/boilerplate.go.txt",
 		Groups: map[string]args.Group{
 			"k3s.cattle.io": {
 				Types: []interface{}{
-					v1.ListenerConfig{},
 					v1.Addon{},
 				},
 				GenerateTypes: true,

@@ -20,44 +20,51 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"strings"
 	"time"
 
 	timetypes "github.com/docker/docker/api/types/time"
-	"github.com/urfave/cli"
-	"k8s.io/api/core/v1"
+	"github.com/urfave/cli/v2"
+	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/kubernetes/pkg/kubelet/kuberuntime/logs"
 )
 
-var logsCommand = cli.Command{
+var logsCommand = &cli.Command{
 	Name:                   "logs",
 	Usage:                  "Fetch the logs of a container",
 	ArgsUsage:              "CONTAINER-ID",
-	SkipArgReorder:         true,
 	UseShortOptionHandling: true,
 	Flags: []cli.Flag{
-		cli.BoolFlag{
-			Name:  "follow, f",
-			Usage: "Follow log output",
+		&cli.BoolFlag{
+			Name:    "follow",
+			Aliases: []string{"f"},
+			Usage:   "Follow log output",
 		},
-		cli.Int64Flag{
+		&cli.BoolFlag{
+			Name:    "previous",
+			Aliases: []string{"p"},
+			Usage:   "Print the logs for the previous instance of the container in a pod if it exists",
+		},
+		&cli.Int64Flag{
 			Name:  "tail",
 			Value: -1,
 			Usage: "Number of lines to show from the end of the logs. Defaults to all",
 		},
-		cli.Int64Flag{
+		&cli.Int64Flag{
 			Name:  "limit-bytes",
 			Value: -1,
 			Usage: "Maximum bytes of logs to return. Defaults to no limit",
 		},
-		cli.StringFlag{
+		&cli.StringFlag{
 			Name:  "since",
 			Value: "",
 			Usage: "Show logs since timestamp (e.g. 2013-01-02T13:23:37) or relative (e.g. 42m for 42 minutes)",
 		},
-		cli.BoolFlag{
-			Name:  "timestamps, t",
-			Usage: "Show timestamps",
+		&cli.BoolFlag{
+			Name:    "timestamps",
+			Aliases: []string{"t"},
+			Usage:   "Show timestamps",
 		},
 	},
 	Action: func(ctx *cli.Context) error {
@@ -77,6 +84,7 @@ var logsCommand = cli.Command{
 			return err
 		}
 		timestamp := ctx.Bool("timestamps")
+		previous := ctx.Bool("previous")
 		logOptions := logs.NewLogOptions(&v1.PodLogOptions{
 			Follow:     ctx.Bool("follow"),
 			TailLines:  &tailLines,
@@ -92,9 +100,16 @@ var logsCommand = cli.Command{
 		if logPath == "" {
 			return fmt.Errorf("The container has not set log path")
 		}
+		if previous {
+			containerAttempt := status.GetMetadata().Attempt
+			if containerAttempt == uint32(0) {
+				return fmt.Errorf("Previous terminated container %s not found", status.GetMetadata().Name)
+			}
+			logPath = fmt.Sprintf("%s%s%s", logPath[:strings.LastIndex(logPath, "/")+1], fmt.Sprint(containerAttempt-1),
+				logPath[strings.LastIndex(logPath, "."):])
+		}
 		return logs.ReadLogs(context.Background(), logPath, status.GetId(), logOptions, runtimeService, os.Stdout, os.Stderr)
 	},
-	After: closeConnection,
 }
 
 // parseTimestamp parses timestamp string as golang duration,

@@ -20,11 +20,13 @@ import (
 	"fmt"
 	"time"
 
+	utilnet "k8s.io/apimachinery/pkg/util/net"
 	"k8s.io/apiserver/pkg/authorization/authorizer"
 	"k8s.io/apiserver/pkg/authorization/authorizerfactory"
 	"k8s.io/apiserver/pkg/authorization/union"
 	"k8s.io/apiserver/plugin/pkg/authorizer/webhook"
 	versionedinformers "k8s.io/client-go/informers"
+	"k8s.io/kubernetes/pkg/auth/authorizer/abac"
 	"k8s.io/kubernetes/pkg/auth/nodeidentifier"
 	"k8s.io/kubernetes/pkg/kubeapiserver/authorizer/modes"
 	"k8s.io/kubernetes/plugin/pkg/auth/authorizer/node"
@@ -38,16 +40,24 @@ type Config struct {
 
 	// Options for ModeABAC
 
+	// Path to an ABAC policy file.
+	PolicyFile string
+
 	// Options for ModeWebhook
 
 	// Kubeconfig file for Webhook authorization plugin.
 	WebhookConfigFile string
+	// API version of subject access reviews to send to the webhook (e.g. "v1", "v1beta1")
+	WebhookVersion string
 	// TTL for caching of authorized responses from the webhook server.
 	WebhookCacheAuthorizedTTL time.Duration
 	// TTL for caching of unauthorized responses from the webhook server.
 	WebhookCacheUnauthorizedTTL time.Duration
 
 	VersionedInformerFactory versionedinformers.SharedInformerFactory
+
+	// Optional field, custom dial function used to connect to webhook
+	CustomDial utilnet.DialFunc
 }
 
 // New returns the right sort of union of multiple authorizer.Authorizer objects
@@ -85,10 +95,19 @@ func (config Config) New() (authorizer.Authorizer, authorizer.RuleResolver, erro
 			alwaysDenyAuthorizer := authorizerfactory.NewAlwaysDenyAuthorizer()
 			authorizers = append(authorizers, alwaysDenyAuthorizer)
 			ruleResolvers = append(ruleResolvers, alwaysDenyAuthorizer)
+		case modes.ModeABAC:
+			abacAuthorizer, err := abac.NewFromFile(config.PolicyFile)
+			if err != nil {
+				return nil, nil, err
+			}
+			authorizers = append(authorizers, abacAuthorizer)
+			ruleResolvers = append(ruleResolvers, abacAuthorizer)
 		case modes.ModeWebhook:
 			webhookAuthorizer, err := webhook.New(config.WebhookConfigFile,
+				config.WebhookVersion,
 				config.WebhookCacheAuthorizedTTL,
-				config.WebhookCacheUnauthorizedTTL)
+				config.WebhookCacheUnauthorizedTTL,
+				config.CustomDial)
 			if err != nil {
 				return nil, nil, err
 			}

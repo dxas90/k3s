@@ -2,8 +2,10 @@ package generic
 
 import (
 	"fmt"
+	"reflect"
 	"strings"
 
+	errors2 "github.com/pkg/errors"
 	"k8s.io/apimachinery/pkg/runtime"
 )
 
@@ -24,7 +26,7 @@ func (h *Handlers) Handle(key string, obj runtime.Object) (runtime.Object, error
 
 	for _, handler := range h.handlers {
 		newObj, err := handler.handler(key, obj)
-		if err != nil {
+		if err != nil && errors2.Cause(err) != ErrSkip {
 			errs = append(errs, &handlerError{
 				HandlerName: handler.name,
 				Err:         err,
@@ -62,6 +64,13 @@ func (e errors) ToErr() error {
 	}
 }
 
+func (e errors) Cause() error {
+	if len(e) > 0 {
+		return e[0]
+	}
+	return nil
+}
+
 type handlerError struct {
 	HandlerName string
 	Err         error
@@ -69,4 +78,19 @@ type handlerError struct {
 
 func (h handlerError) Error() string {
 	return fmt.Sprintf("handler %s: %v", h.HandlerName, h.Err)
+}
+
+func (h handlerError) Cause() error {
+	return h.Err
+}
+
+func ToName(h interface{}) string {
+	if str, ok := h.(fmt.Stringer); ok {
+		return str.String()
+	}
+	s := reflect.ValueOf(h).Type().String()
+	if len(s) > 1 && s[0] == '*' {
+		return s[1:]
+	}
+	return s
 }

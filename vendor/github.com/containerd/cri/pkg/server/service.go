@@ -25,6 +25,7 @@ import (
 
 	"github.com/containerd/containerd"
 	"github.com/containerd/containerd/plugin"
+	"github.com/containerd/cri/pkg/store/label"
 	cni "github.com/containerd/go-cni"
 	runcapparmor "github.com/opencontainers/runc/libcontainer/apparmor"
 	runcseccomp "github.com/opencontainers/runc/libcontainer/seccomp"
@@ -33,10 +34,9 @@ import (
 	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
 	"google.golang.org/grpc"
-	runtime "k8s.io/kubernetes/pkg/kubelet/apis/cri/runtime/v1alpha2"
+	runtime "k8s.io/cri-api/pkg/apis/runtime/v1alpha2"
 	"k8s.io/kubernetes/pkg/kubelet/server/streaming"
 
-	api "github.com/containerd/cri/pkg/api/v1"
 	"github.com/containerd/cri/pkg/atomic"
 	criconfig "github.com/containerd/cri/pkg/config"
 	ctrdutil "github.com/containerd/cri/pkg/containerd/util"
@@ -52,7 +52,6 @@ import (
 type grpcServices interface {
 	runtime.RuntimeServiceServer
 	runtime.ImageServiceServer
-	api.CRIPluginServiceServer
 }
 
 // CRIService is the interface implement CRI remote service server.
@@ -106,14 +105,15 @@ type criService struct {
 // NewCRIService returns a new instance of CRIService
 func NewCRIService(config criconfig.Config, client *containerd.Client) (CRIService, error) {
 	var err error
+	labels := label.NewStore()
 	c := &criService{
 		config:             config,
 		client:             client,
 		apparmorEnabled:    runcapparmor.IsEnabled() && !config.DisableApparmor,
 		seccompEnabled:     runcseccomp.IsEnabled(),
 		os:                 osinterface.RealOS{},
-		sandboxStore:       sandboxstore.NewStore(),
-		containerStore:     containerstore.NewStore(),
+		sandboxStore:       sandboxstore.NewStore(labels),
+		containerStore:     containerstore.NewStore(labels),
 		imageStore:         imagestore.NewStore(client),
 		snapshotStore:      snapshotstore.NewStore(),
 		sandboxNameIndex:   registrar.NewRegistrar(),
@@ -148,6 +148,7 @@ func NewCRIService(config criconfig.Config, client *containerd.Client) (CRIServi
 	// of the default network interface as the pod IP.
 	c.netPlugin, err = cni.New(cni.WithMinNetworkCount(networkAttachCount),
 		cni.WithPluginConfDir(config.NetworkPluginConfDir),
+		cni.WithPluginMaxConfNum(config.NetworkPluginMaxConfNum),
 		cni.WithPluginDir([]string{config.NetworkPluginBinDir}))
 	if err != nil {
 		return nil, errors.Wrap(err, "failed to initialize cni")
@@ -159,7 +160,7 @@ func NewCRIService(config criconfig.Config, client *containerd.Client) (CRIServi
 		logrus.WithError(err).Error("Failed to load cni during init, please check CRI plugin status before setting up network for pods")
 	}
 	// prepare streaming server
-	c.streamServer, err = newStreamServer(c, config.StreamServerAddress, config.StreamServerPort)
+	c.streamServer, err = newStreamServer(c, config.StreamServerAddress, config.StreamServerPort, config.StreamIdleTimeout)
 	if err != nil {
 		return nil, errors.Wrap(err, "failed to create stream server")
 	}
@@ -172,10 +173,15 @@ func NewCRIService(config criconfig.Config, client *containerd.Client) (CRIServi
 // Register registers all required services onto a specific grpc server.
 // This is used by containerd cri plugin.
 func (c *criService) Register(s *grpc.Server) error {
-	instrumented := newInstrumentedService(c)
-	runtime.RegisterRuntimeServiceServer(s, instrumented)
-	runtime.RegisterImageServiceServer(s, instrumented)
-	api.RegisterCRIPluginServiceServer(s, instrumented)
+	return c.register(s)
+}
+
+// RegisterTCP register all required services onto a GRPC server on TCP.
+// This is used by containerd CRI plugin.
+func (c *criService) RegisterTCP(s *grpc.Server) error {
+	if !c.config.DisableTCPService {
+		return c.register(s)
+	}
 	return nil
 }
 
@@ -266,6 +272,13 @@ func (c *criService) Close() error {
 	if err := c.streamServer.Stop(); err != nil {
 		return errors.Wrap(err, "failed to stop stream server")
 	}
+	return nil
+}
+
+func (c *criService) register(s *grpc.Server) error {
+	instrumented := newInstrumentedService(c)
+	runtime.RegisterRuntimeServiceServer(s, instrumented)
+	runtime.RegisterImageServiceServer(s, instrumented)
 	return nil
 }
 

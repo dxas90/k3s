@@ -2,7 +2,6 @@ package agent
 
 import (
 	"bufio"
-	"context"
 	"math/rand"
 	"os"
 	"path/filepath"
@@ -11,52 +10,53 @@ import (
 
 	"github.com/opencontainers/runc/libcontainer/system"
 	"github.com/rancher/k3s/pkg/daemons/config"
+	"github.com/rancher/k3s/pkg/daemons/executor"
 	"github.com/sirupsen/logrus"
 	"k8s.io/apimachinery/pkg/util/net"
 	"k8s.io/component-base/logs"
-	app2 "k8s.io/kubernetes/cmd/kube-proxy/app"
-	"k8s.io/kubernetes/cmd/kubelet/app"
 	"k8s.io/kubernetes/pkg/kubeapiserver/authorizer/modes"
 
-	_ "k8s.io/kubernetes/pkg/client/metrics/prometheus" // for client metric registration
-	_ "k8s.io/kubernetes/pkg/version/prometheus"        // for version metric registration
+	_ "k8s.io/component-base/metrics/prometheus/restclient" // for client metric registration
+	_ "k8s.io/component-base/metrics/prometheus/version"    // for version metric registration
 )
 
 func Agent(config *config.Agent) error {
 	rand.Seed(time.Now().UTC().UnixNano())
 
-	kubelet(config)
-	kubeProxy(config)
+	logs.InitLogs()
+	defer logs.FlushLogs()
+
+	if err := startKubelet(config); err != nil {
+		return err
+	}
+
+	if !config.DisableKubeProxy {
+		return startKubeProxy(config)
+	}
 
 	return nil
 }
 
-func kubeProxy(cfg *config.Agent) {
+func startKubeProxy(cfg *config.Agent) error {
 	argsMap := map[string]string{
 		"proxy-mode":           "iptables",
 		"healthz-bind-address": "127.0.0.1",
 		"kubeconfig":           cfg.KubeConfigKubeProxy,
 		"cluster-cidr":         cfg.ClusterCIDR.String(),
 	}
-	args := config.GetArgsList(argsMap, cfg.ExtraKubeProxyArgs)
+	if cfg.NodeName != "" {
+		argsMap["hostname-override"] = cfg.NodeName
+	}
 
-	command := app2.NewProxyCommand()
-	command.SetArgs(args)
-	go func() {
-		err := command.Execute()
-		logrus.Fatalf("kube-proxy exited: %v", err)
-	}()
+	args := config.GetArgsList(argsMap, cfg.ExtraKubeProxyArgs)
+	logrus.Infof("Running kube-proxy %s", config.ArgString(args))
+	return executor.KubeProxy(args)
 }
 
-func kubelet(cfg *config.Agent) {
-	command := app.NewKubeletCommand(context.Background().Done())
-	logs.InitLogs()
-	defer logs.FlushLogs()
-
+func startKubelet(cfg *config.Agent) error {
 	argsMap := map[string]string{
 		"healthz-bind-address":     "127.0.0.1",
 		"read-only-port":           "0",
-		"allow-privileged":         "true",
 		"cluster-domain":           cfg.ClusterDomain,
 		"kubeconfig":               cfg.KubeConfigKubelet,
 		"eviction-hard":            "imagefs.available<5%,nodefs.available<5%",
@@ -65,7 +65,14 @@ func kubelet(cfg *config.Agent) {
 		//"cgroup-root": "/k3s",
 		"cgroup-driver":                "cgroupfs",
 		"authentication-token-webhook": "true",
+		"anonymous-auth":               "false",
 		"authorization-mode":           modes.ModeWebhook,
+	}
+	if cfg.PodManifests != "" && argsMap["pod-manifest-path"] == "" {
+		argsMap["pod-manifest-path"] = cfg.PodManifests
+	}
+	if err := os.MkdirAll(argsMap["pod-manifest-path"], 0755); err != nil {
+		logrus.Errorf("Failed to mkdir %s: %v", argsMap["pod-manifest-path"], err)
 	}
 	if cfg.RootDir != "" {
 		argsMap["root-dir"] = cfg.RootDir
@@ -90,7 +97,10 @@ func kubelet(cfg *config.Agent) {
 	if cfg.RuntimeSocket != "" {
 		argsMap["container-runtime"] = "remote"
 		argsMap["container-runtime-endpoint"] = cfg.RuntimeSocket
+		argsMap["containerd"] = cfg.RuntimeSocket
 		argsMap["serialize-image-pulls"] = "false"
+	} else if cfg.PauseImage != "" {
+		argsMap["pod-infra-container-image"] = cfg.PauseImage
 	}
 	if cfg.ListenAddress != "" {
 		argsMap["address"] = cfg.ListenAddress
@@ -133,13 +143,22 @@ func kubelet(cfg *config.Agent) {
 	if len(cfg.NodeTaints) > 0 {
 		argsMap["register-with-taints"] = strings.Join(cfg.NodeTaints, ",")
 	}
-	args := config.GetArgsList(argsMap, cfg.ExtraKubeletArgs)
-	command.SetArgs(args)
+	if !cfg.DisableCCM {
+		argsMap["cloud-provider"] = "external"
+	}
 
-	go func() {
-		logrus.Infof("Running kubelet %s", config.ArgString(args))
-		logrus.Fatalf("kubelet exited: %v", command.Execute())
-	}()
+	if cfg.Rootless {
+		// flags are from https://github.com/rootless-containers/usernetes/blob/v20190826.0/boot/kubelet.sh
+		argsMap["cgroup-driver"] = "none"
+		argsMap["feature-gates=SupportNoneCgroupDriver"] = "true"
+		argsMap["cgroups-per-qos"] = "false"
+		argsMap["enforce-node-allocatable"] = ""
+	}
+
+	args := config.GetArgsList(argsMap, cfg.ExtraKubeletArgs)
+	logrus.Infof("Running kubelet %s", config.ArgString(args))
+
+	return executor.Kubelet(args)
 }
 
 func addFeatureGate(current, new string) string {

@@ -55,6 +55,7 @@ data:
     .:53 {
         errors
         health
+        ready
         kubernetes %{CLUSTER_DOMAIN}% in-addr.arpa ip6.arpa {
           pods insecure
           upstream
@@ -65,14 +66,14 @@ data:
           fallthrough
         }
         prometheus :9153
-        proxy . /etc/resolv.conf
+        forward . /etc/resolv.conf
         cache 30
         loop
         reload
         loadbalance
     }
 ---
-apiVersion: extensions/v1beta1
+apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: coredns
@@ -98,11 +99,14 @@ spec:
       tolerations:
         - key: "CriticalAddonsOnly"
           operator: "Exists"
+        - key: "node-role.kubernetes.io/master"
+          operator: "Exists"
+          effect: "NoSchedule"
       nodeSelector:
         beta.kubernetes.io/os: linux
       containers:
       - name: coredns
-        image: coredns/coredns:1.3.0
+        image: rancher/coredns-coredns:1.6.3
         imagePullPolicy: IfNotPresent
         resources:
           limits:
@@ -139,9 +143,20 @@ spec:
             port: 8080
             scheme: HTTP
           initialDelaySeconds: 60
-          timeoutSeconds: 5
+          periodSeconds: 10
+          timeoutSeconds: 1
           successThreshold: 1
-          failureThreshold: 5
+          failureThreshold: 3
+        readinessProbe:
+          httpGet:
+            path: /ready
+            port: 8181
+            scheme: HTTP
+          initialDelaySeconds: 0
+          periodSeconds: 2
+          timeoutSeconds: 1
+          successThreshold: 1
+          failureThreshold: 3
       dnsPolicy: Default
       volumes:
         - name: config-volume

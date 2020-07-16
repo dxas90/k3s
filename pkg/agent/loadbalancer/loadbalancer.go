@@ -8,7 +8,7 @@ import (
 	"sync"
 
 	"github.com/google/tcpproxy"
-	"github.com/rancher/k3s/pkg/cli/cmds"
+	"github.com/rancher/k3s/pkg/version"
 	"github.com/sirupsen/logrus"
 )
 
@@ -28,15 +28,12 @@ type LoadBalancer struct {
 	nextServerIndex       int
 }
 
-const (
-	serviceName = "k3s-agent-load-balancer"
+var (
+	SupervisorServiceName = version.Program + "-agent-load-balancer"
+	APIServerServiceName  = version.Program + "-api-server-agent-load-balancer"
 )
 
-func Setup(ctx context.Context, cfg cmds.Agent) (_lb *LoadBalancer, _err error) {
-	if cfg.DisableLoadBalancer {
-		return nil, nil
-	}
-
+func New(dataDir, serviceName, serverURL string) (_lb *LoadBalancer, _err error) {
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	defer func() {
 		if _err != nil {
@@ -51,18 +48,18 @@ func Setup(ctx context.Context, cfg cmds.Agent) (_lb *LoadBalancer, _err error) 
 	}
 	localAddress := listener.Addr().String()
 
-	originalServerAddress, localServerURL, err := parseURL(cfg.ServerURL, localAddress)
+	originalServerAddress, localServerURL, err := parseURL(serverURL, localAddress)
 	if err != nil {
 		return nil, err
 	}
 
 	lb := &LoadBalancer{
 		dialer:                &net.Dialer{},
-		configFile:            filepath.Join(cfg.DataDir, "etc", serviceName+".json"),
+		configFile:            filepath.Join(dataDir, "etc", serviceName+".json"),
 		localAddress:          localAddress,
 		localServerURL:        localServerURL,
 		originalServerAddress: originalServerAddress,
-		ServerURL:             cfg.ServerURL,
+		ServerURL:             serverURL,
 	}
 
 	lb.setServers([]string{lb.originalServerAddress})

@@ -8,7 +8,6 @@ import (
 	"os"
 	"sort"
 
-	"k8s.io/apimachinery/pkg/types"
 	helmv1 "github.com/rancher/helm-controller/pkg/apis/helm.cattle.io/v1"
 	helmcontroller "github.com/rancher/helm-controller/pkg/generated/controllers/helm.cattle.io/v1"
 	batchcontroller "github.com/rancher/wrangler-api/pkg/generated/controllers/batch/v1"
@@ -24,6 +23,7 @@ import (
 	meta "k8s.io/apimachinery/pkg/apis/meta/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/intstr"
 )
 
@@ -39,9 +39,10 @@ type Controller struct {
 }
 
 const (
-	image = "rancher/klipper-helm:v0.1.5"
-	label = "helmcharts.helm.cattle.io/chart"
-	name  = "helm-controller"
+	image   = "rancher/klipper-helm:v0.2.7"
+	Label   = "helmcharts.helm.cattle.io/chart"
+	CRDName = "helmcharts.helm.cattle.io"
+	Name    = "helm-controller"
 )
 
 func Register(ctx context.Context, apply apply.Apply,
@@ -50,7 +51,7 @@ func Register(ctx context.Context, apply apply.Apply,
 	crbs rbaccontroller.ClusterRoleBindingController,
 	sas corecontroller.ServiceAccountController,
 	cm corecontroller.ConfigMapController) {
-	apply = apply.WithSetID(name).
+	apply = apply.WithSetID(Name).
 		WithCacheTypes(helms, jobs, crbs, sas, cm).
 		WithStrictCaching().WithPatcher(batch.SchemeGroupVersion.WithKind("Job"), func(namespace, name string, pt types.PatchType, data []byte) (runtime.Object, error) {
 		err := jobs.Delete(namespace, name, &metav1.DeleteOptions{})
@@ -63,7 +64,7 @@ func Register(ctx context.Context, apply apply.Apply,
 	relatedresource.Watch(ctx, "helm-pod-watch",
 		func(namespace, name string, obj runtime.Object) ([]relatedresource.Key, error) {
 			if job, ok := obj.(*batch.Job); ok {
-				name := job.Labels[label]
+				name := job.Labels[Label]
 				if name != "" {
 					return []relatedresource.Key{
 						{
@@ -84,8 +85,8 @@ func Register(ctx context.Context, apply apply.Apply,
 		apply:          apply,
 	}
 
-	helms.OnChange(ctx, name, controller.OnHelmChanged)
-	helms.OnRemove(ctx, name, controller.OnHelmRemove)
+	helms.OnChange(ctx, Name, controller.OnHelmChanged)
+	helms.OnRemove(ctx, Name, controller.OnHelmRemove)
 }
 
 func (c *Controller) OnHelmChanged(key string, chart *helmv1.HelmChart) (*helmv1.HelmChart, error) {
@@ -93,17 +94,20 @@ func (c *Controller) OnHelmChanged(key string, chart *helmv1.HelmChart) (*helmv1
 		return nil, nil
 	}
 
-	if chart.Spec.Chart == "" {
+	if chart.Spec.Chart == "" && chart.Spec.ChartContent == "" {
 		return chart, nil
 	}
 
 	objs := objectset.NewObjectSet()
-	job, configMap := job(chart)
+	job, valuesConfigMap, contentConfigMap := job(chart)
 	objs.Add(serviceAccount(chart))
 	objs.Add(roleBinding(chart))
 	objs.Add(job)
-	if configMap != nil {
-		objs.Add(configMap)
+	if valuesConfigMap != nil {
+		objs.Add(valuesConfigMap)
+	}
+	if contentConfigMap != nil {
+		objs.Add(contentConfigMap)
 	}
 
 	if err := c.apply.WithOwner(chart).Apply(objs); err != nil {
@@ -119,7 +123,7 @@ func (c *Controller) OnHelmRemove(key string, chart *helmv1.HelmChart) (*helmv1.
 	if chart.Spec.Chart == "" {
 		return chart, nil
 	}
-	job, _ := job(chart)
+	job, _, _ := job(chart)
 	job, err := c.jobsCache.Get(chart.Namespace, job.Name)
 
 	if errors.IsNotFound(err) {
@@ -146,7 +150,7 @@ func (c *Controller) OnHelmRemove(key string, chart *helmv1.HelmChart) (*helmv1.
 	return newChart, c.apply.WithOwner(newChart).Apply(objectset.NewObjectSet())
 }
 
-func job(chart *helmv1.HelmChart) (*batch.Job, *core.ConfigMap) {
+func job(chart *helmv1.HelmChart) (*batch.Job, *core.ConfigMap, *core.ConfigMap) {
 	oneThousand := int32(1000)
 	valuesHash := sha256.Sum256([]byte(chart.Spec.ValuesContent))
 
@@ -154,6 +158,7 @@ func job(chart *helmv1.HelmChart) (*batch.Job, *core.ConfigMap) {
 	if chart.DeletionTimestamp != nil {
 		action = "delete"
 	}
+
 	job := &batch.Job{
 		TypeMeta: meta.TypeMeta{
 			APIVersion: "batch/v1",
@@ -163,7 +168,7 @@ func job(chart *helmv1.HelmChart) (*batch.Job, *core.ConfigMap) {
 			Name:      fmt.Sprintf("helm-%s-%s", action, chart.Name),
 			Namespace: chart.Namespace,
 			Labels: map[string]string{
-				label: chart.Name,
+				Label: chart.Name,
 			},
 		},
 		Spec: batch.JobSpec{
@@ -171,7 +176,7 @@ func job(chart *helmv1.HelmChart) (*batch.Job, *core.ConfigMap) {
 			Template: core.PodTemplateSpec{
 				ObjectMeta: meta.ObjectMeta{
 					Labels: map[string]string{
-						label: chart.Name,
+						Label: chart.Name,
 					},
 				},
 				Spec: core.PodSpec{
@@ -199,6 +204,22 @@ func job(chart *helmv1.HelmChart) (*batch.Job, *core.ConfigMap) {
 									Name:  "VALUES_HASH",
 									Value: hex.EncodeToString(valuesHash[:]),
 								},
+								{
+									Name:  "HELM_DRIVER",
+									Value: "secret",
+								},
+								{
+									Name:  "CHART_NAMESPACE",
+									Value: chart.Namespace,
+								},
+								{
+									Name:  "CHART",
+									Value: chart.Spec.Chart,
+								},
+								{
+									Name:  "HELM_VERSION",
+									Value: chart.Spec.HelmVersion,
+								},
 							},
 						},
 					},
@@ -207,36 +228,35 @@ func job(chart *helmv1.HelmChart) (*batch.Job, *core.ConfigMap) {
 			},
 		},
 	}
-	setProxyEnv(job)
-	configMap := configMap(chart)
-	if configMap == nil {
-		return job, nil
-	}
 
-	job.Spec.Template.Spec.Volumes = []core.Volume{
-		{
-			Name: "values",
-			VolumeSource: core.VolumeSource{
-				ConfigMap: &core.ConfigMapVolumeSource{
-					LocalObjectReference: core.LocalObjectReference{
-						Name: configMap.Name,
-					},
-				},
+	if chart.Spec.Bootstrap {
+		job.Spec.Template.Spec.HostNetwork = true
+		job.Spec.Template.Spec.Tolerations = []core.Toleration{
+			{
+				Key:    "node.kubernetes.io/not-ready",
+				Effect: "NoSchedule",
 			},
-		},
+		}
+		job.Spec.Template.Spec.Containers[0].Env = append(job.Spec.Template.Spec.Containers[0].Env, []core.EnvVar{
+			{
+				Name:  "KUBERNETES_SERVICE_HOST",
+				Value: "127.0.0.1"},
+			{
+				Name:  "KUBERNETES_SERVICE_PORT",
+				Value: "6443"},
+		}...)
+		job.Spec.Template.Spec.NodeSelector = make(map[string]string)
+		job.Spec.Template.Spec.NodeSelector["node-role.kubernetes.io/master"] = "true"
 	}
 
-	job.Spec.Template.Spec.Containers[0].VolumeMounts = []core.VolumeMount{
-		{
-			MountPath: "/config",
-			Name:      "values",
-		},
-	}
+	setProxyEnv(job)
+	valueConfigMap := setValuesConfigMap(job, chart)
+	contentConfigMap := setContentConfigMap(job, chart)
 
-	return job, configMap
+	return job, valueConfigMap, contentConfigMap
 }
 
-func configMap(chart *helmv1.HelmChart) *core.ConfigMap {
+func valuesConfigMap(chart *helmv1.HelmChart) *core.ConfigMap {
 	if chart.Spec.ValuesContent == "" {
 		return nil
 	}
@@ -298,15 +318,12 @@ func args(chart *helmv1.HelmChart) []string {
 	if chart.DeletionTimestamp != nil {
 		return []string{
 			"delete",
-			"--purge", chart.Name,
 		}
 	}
 
 	spec := chart.Spec
 	args := []string{
 		"install",
-		"--name", chart.Name,
-		spec.Chart,
 	}
 	if spec.TargetNamespace != "" {
 		args = append(args, "--namespace", spec.TargetNamespace)
@@ -320,7 +337,9 @@ func args(chart *helmv1.HelmChart) []string {
 
 	for _, k := range keys(spec.Set) {
 		val := spec.Set[k]
-		if val.StrVal != "" {
+		if val.StrVal == "false" || val.StrVal == "true" {
+			args = append(args, "--set", fmt.Sprintf("%s=%s", k, val.StrVal))
+		} else if val.StrVal != "" {
 			args = append(args, "--set-string", fmt.Sprintf("%s=%s", k, val.StrVal))
 		} else {
 			args = append(args, "--set", fmt.Sprintf("%s=%d", k, val.IntVal))
@@ -363,4 +382,81 @@ func setProxyEnv(job *batch.Job) {
 			job.Spec.Template.Spec.Containers[0].Env,
 			envar)
 	}
+}
+
+func contentConfigMap(chart *helmv1.HelmChart) *core.ConfigMap {
+	if chart.Spec.ChartContent == "" {
+		return nil
+	}
+	return &core.ConfigMap{
+		TypeMeta: meta.TypeMeta{
+			APIVersion: "v1",
+			Kind:       "ConfigMap",
+		},
+		ObjectMeta: meta.ObjectMeta{
+			Name:      fmt.Sprintf("chart-content-%s", chart.Name),
+			Namespace: chart.Namespace,
+		},
+		Data: map[string]string{
+			fmt.Sprintf("%s.tgz.base64", chart.Name): chart.Spec.ChartContent,
+		},
+	}
+}
+
+func setValuesConfigMap(job *batch.Job, chart *helmv1.HelmChart) *core.ConfigMap {
+	configMap := valuesConfigMap(chart)
+	if configMap == nil {
+		return nil
+	}
+
+	job.Spec.Template.Spec.Volumes = append(job.Spec.Template.Spec.Volumes, []core.Volume{
+		{
+			Name: "values",
+			VolumeSource: core.VolumeSource{
+				ConfigMap: &core.ConfigMapVolumeSource{
+					LocalObjectReference: core.LocalObjectReference{
+						Name: configMap.Name,
+					},
+				},
+			},
+		},
+	}...)
+
+	job.Spec.Template.Spec.Containers[0].VolumeMounts = append(job.Spec.Template.Spec.Containers[0].VolumeMounts, []core.VolumeMount{
+		{
+			MountPath: "/config",
+			Name:      "values",
+		},
+	}...)
+
+	return configMap
+}
+
+func setContentConfigMap(job *batch.Job, chart *helmv1.HelmChart) *core.ConfigMap {
+	configMap := contentConfigMap(chart)
+	if configMap == nil {
+		return nil
+	}
+
+	job.Spec.Template.Spec.Volumes = append(job.Spec.Template.Spec.Volumes, []core.Volume{
+		{
+			Name: "content",
+			VolumeSource: core.VolumeSource{
+				ConfigMap: &core.ConfigMapVolumeSource{
+					LocalObjectReference: core.LocalObjectReference{
+						Name: configMap.Name,
+					},
+				},
+			},
+		},
+	}...)
+
+	job.Spec.Template.Spec.Containers[0].VolumeMounts = append(job.Spec.Template.Spec.Containers[0].VolumeMounts, []core.VolumeMount{
+		{
+			MountPath: "/chart",
+			Name:      "content",
+		},
+	}...)
+
+	return configMap
 }

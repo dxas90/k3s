@@ -20,7 +20,7 @@ import (
 	"encoding/json"
 
 	"github.com/pkg/errors"
-	runtime "k8s.io/kubernetes/pkg/kubelet/apis/cri/runtime/v1alpha2"
+	runtime "k8s.io/cri-api/pkg/apis/runtime/v1alpha2"
 )
 
 // NOTE(random-liu):
@@ -61,6 +61,8 @@ type Metadata struct {
 	// StopSignal is the system call signal that will be sent to the container to exit.
 	// TODO(random-liu): Add integration test for stop signal.
 	StopSignal string
+	// ProcessLabel is the SELinux process label for the container
+	ProcessLabel string
 }
 
 // MarshalJSON encodes Metadata into bytes in json format.

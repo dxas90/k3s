@@ -22,12 +22,12 @@ import (
 
 	dockerterm "github.com/docker/docker/pkg/term"
 	"github.com/sirupsen/logrus"
-	"github.com/urfave/cli"
+	"github.com/urfave/cli/v2"
 	"golang.org/x/net/context"
 	restclient "k8s.io/client-go/rest"
 	remoteclient "k8s.io/client-go/tools/remotecommand"
-	"k8s.io/kubernetes/pkg/kubectl/util/term"
-	pb "k8s.io/kubernetes/pkg/kubelet/apis/cri/runtime/v1alpha2"
+	pb "k8s.io/cri-api/pkg/apis/runtime/v1alpha2"
+	"k8s.io/kubectl/pkg/util/term"
 )
 
 const (
@@ -36,46 +36,50 @@ const (
 	kubeletURLHost   = "http://127.0.0.1:10250"
 )
 
-var runtimeExecCommand = cli.Command{
+var runtimeExecCommand = &cli.Command{
 	Name:                   "exec",
 	Usage:                  "Run a command in a running container",
 	ArgsUsage:              "CONTAINER-ID COMMAND [ARG...]",
-	SkipArgReorder:         true,
 	UseShortOptionHandling: true,
 	Flags: []cli.Flag{
-		cli.BoolFlag{
-			Name:  "sync, s",
-			Usage: "Run the command synchronously",
+		&cli.BoolFlag{
+			Name:    "sync",
+			Aliases: []string{"s"},
+			Usage:   "Run the command synchronously",
 		},
-		cli.Int64Flag{
+		&cli.Int64Flag{
 			Name:  "timeout",
 			Value: 0,
 			Usage: "Timeout in seconds",
 		},
-		cli.BoolFlag{
-			Name:  "tty, t",
-			Usage: "Allocate a pseudo-TTY",
+		&cli.BoolFlag{
+			Name:    "tty",
+			Aliases: []string{"t"},
+			Usage:   "Allocate a pseudo-TTY",
 		},
-		cli.BoolFlag{
-			Name:  "interactive, i",
-			Usage: "Keep STDIN open",
+		&cli.BoolFlag{
+			Name:    "interactive",
+			Aliases: []string{"i"},
+			Usage:   "Keep STDIN open",
 		},
 	},
 	Action: func(context *cli.Context) error {
-		if len(context.Args()) < 2 {
+		if context.Args().Len() < 2 {
 			return cli.ShowSubcommandHelp(context)
 		}
 
-		if err := getRuntimeClient(context); err != nil {
+		runtimeClient, conn, err := getRuntimeClient(context)
+		if err != nil {
 			return err
 		}
+		defer closeConnection(context, conn)
 
 		var opts = execOptions{
 			id:      context.Args().First(),
 			timeout: context.Int64("timeout"),
 			tty:     context.Bool("tty"),
 			stdin:   context.Bool("interactive"),
-			cmd:     context.Args()[1:],
+			cmd:     context.Args().Slice()[1:],
 		}
 		if context.Bool("sync") {
 			exitCode, err := ExecSync(runtimeClient, opts)
@@ -87,13 +91,12 @@ var runtimeExecCommand = cli.Command{
 			}
 			return nil
 		}
-		err := Exec(runtimeClient, opts)
+		err = Exec(runtimeClient, opts)
 		if err != nil {
 			return fmt.Errorf("execing command in container failed: %v", err)
 		}
 		return nil
 	},
-	After: closeConnection,
 }
 
 // ExecSync sends an ExecSyncRequest to the server, and parses

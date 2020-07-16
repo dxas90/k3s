@@ -20,13 +20,18 @@ package v1
 
 import (
 	"context"
+	"time"
 
 	v1 "github.com/rancher/helm-controller/pkg/apis/helm.cattle.io/v1"
 	clientset "github.com/rancher/helm-controller/pkg/generated/clientset/versioned/typed/helm.cattle.io/v1"
 	informers "github.com/rancher/helm-controller/pkg/generated/informers/externalversions/helm.cattle.io/v1"
 	listers "github.com/rancher/helm-controller/pkg/generated/listers/helm.cattle.io/v1"
+	"github.com/rancher/wrangler/pkg/apply"
+	"github.com/rancher/wrangler/pkg/condition"
 	"github.com/rancher/wrangler/pkg/generic"
+	"github.com/rancher/wrangler/pkg/kv"
 	"k8s.io/apimachinery/pkg/api/equality"
+	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -40,20 +45,15 @@ import (
 type HelmChartHandler func(string, *v1.HelmChart) (*v1.HelmChart, error)
 
 type HelmChartController interface {
+	generic.ControllerMeta
 	HelmChartClient
 
 	OnChange(ctx context.Context, name string, sync HelmChartHandler)
 	OnRemove(ctx context.Context, name string, sync HelmChartHandler)
 	Enqueue(namespace, name string)
+	EnqueueAfter(namespace, name string, duration time.Duration)
 
 	Cache() HelmChartCache
-
-	Informer() cache.SharedIndexInformer
-	GroupVersionKind() schema.GroupVersionKind
-
-	AddGenericHandler(ctx context.Context, name string, handler generic.Handler)
-	AddGenericRemoveHandler(ctx context.Context, name string, handler generic.Handler)
-	Updater() generic.Updater
 }
 
 type HelmChartClient interface {
@@ -118,26 +118,21 @@ func (c *helmChartController) Updater() generic.Updater {
 	}
 }
 
-func UpdateHelmChartOnChange(updater generic.Updater, handler HelmChartHandler) HelmChartHandler {
-	return func(key string, obj *v1.HelmChart) (*v1.HelmChart, error) {
-		if obj == nil {
-			return handler(key, nil)
-		}
-
-		copyObj := obj.DeepCopy()
-		newObj, err := handler(key, copyObj)
-		if newObj != nil {
-			copyObj = newObj
-		}
-		if obj.ResourceVersion == copyObj.ResourceVersion && !equality.Semantic.DeepEqual(obj, copyObj) {
-			newObj, err := updater(copyObj)
-			if newObj != nil && err == nil {
-				copyObj = newObj.(*v1.HelmChart)
-			}
-		}
-
-		return copyObj, err
+func UpdateHelmChartDeepCopyOnChange(client HelmChartClient, obj *v1.HelmChart, handler func(obj *v1.HelmChart) (*v1.HelmChart, error)) (*v1.HelmChart, error) {
+	if obj == nil {
+		return obj, nil
 	}
+
+	copyObj := obj.DeepCopy()
+	newObj, err := handler(copyObj)
+	if newObj != nil {
+		copyObj = newObj
+	}
+	if obj.ResourceVersion == copyObj.ResourceVersion && !equality.Semantic.DeepEqual(obj, copyObj) {
+		return client.Update(copyObj)
+	}
+
+	return copyObj, err
 }
 
 func (c *helmChartController) AddGenericHandler(ctx context.Context, name string, handler generic.Handler) {
@@ -162,6 +157,10 @@ func (c *helmChartController) Enqueue(namespace, name string) {
 	c.controllerManager.Enqueue(c.gvk, c.informer.Informer(), namespace, name)
 }
 
+func (c *helmChartController) EnqueueAfter(namespace, name string, duration time.Duration) {
+	c.controllerManager.EnqueueAfter(c.gvk, c.informer.Informer(), namespace, name, duration)
+}
+
 func (c *helmChartController) Informer() cache.SharedIndexInformer {
 	return c.informer.Informer()
 }
@@ -178,35 +177,38 @@ func (c *helmChartController) Cache() HelmChartCache {
 }
 
 func (c *helmChartController) Create(obj *v1.HelmChart) (*v1.HelmChart, error) {
-	return c.clientGetter.HelmCharts(obj.Namespace).Create(obj)
+	return c.clientGetter.HelmCharts(obj.Namespace).Create(context.TODO(), obj, metav1.CreateOptions{})
 }
 
 func (c *helmChartController) Update(obj *v1.HelmChart) (*v1.HelmChart, error) {
-	return c.clientGetter.HelmCharts(obj.Namespace).Update(obj)
+	return c.clientGetter.HelmCharts(obj.Namespace).Update(context.TODO(), obj, metav1.UpdateOptions{})
 }
 
 func (c *helmChartController) UpdateStatus(obj *v1.HelmChart) (*v1.HelmChart, error) {
-	return c.clientGetter.HelmCharts(obj.Namespace).UpdateStatus(obj)
+	return c.clientGetter.HelmCharts(obj.Namespace).UpdateStatus(context.TODO(), obj, metav1.UpdateOptions{})
 }
 
 func (c *helmChartController) Delete(namespace, name string, options *metav1.DeleteOptions) error {
-	return c.clientGetter.HelmCharts(namespace).Delete(name, options)
+	if options == nil {
+		options = &metav1.DeleteOptions{}
+	}
+	return c.clientGetter.HelmCharts(namespace).Delete(context.TODO(), name, *options)
 }
 
 func (c *helmChartController) Get(namespace, name string, options metav1.GetOptions) (*v1.HelmChart, error) {
-	return c.clientGetter.HelmCharts(namespace).Get(name, options)
+	return c.clientGetter.HelmCharts(namespace).Get(context.TODO(), name, options)
 }
 
 func (c *helmChartController) List(namespace string, opts metav1.ListOptions) (*v1.HelmChartList, error) {
-	return c.clientGetter.HelmCharts(namespace).List(opts)
+	return c.clientGetter.HelmCharts(namespace).List(context.TODO(), opts)
 }
 
 func (c *helmChartController) Watch(namespace string, opts metav1.ListOptions) (watch.Interface, error) {
-	return c.clientGetter.HelmCharts(namespace).Watch(opts)
+	return c.clientGetter.HelmCharts(namespace).Watch(context.TODO(), opts)
 }
 
 func (c *helmChartController) Patch(namespace, name string, pt types.PatchType, data []byte, subresources ...string) (result *v1.HelmChart, err error) {
-	return c.clientGetter.HelmCharts(namespace).Patch(name, pt, data, subresources...)
+	return c.clientGetter.HelmCharts(namespace).Patch(context.TODO(), name, pt, data, metav1.PatchOptions{}, subresources...)
 }
 
 type helmChartCache struct {
@@ -235,8 +237,109 @@ func (c *helmChartCache) GetByIndex(indexName, key string) (result []*v1.HelmCha
 	if err != nil {
 		return nil, err
 	}
+	result = make([]*v1.HelmChart, 0, len(objs))
 	for _, obj := range objs {
 		result = append(result, obj.(*v1.HelmChart))
 	}
 	return result, nil
+}
+
+type HelmChartStatusHandler func(obj *v1.HelmChart, status v1.HelmChartStatus) (v1.HelmChartStatus, error)
+
+type HelmChartGeneratingHandler func(obj *v1.HelmChart, status v1.HelmChartStatus) ([]runtime.Object, v1.HelmChartStatus, error)
+
+func RegisterHelmChartStatusHandler(ctx context.Context, controller HelmChartController, condition condition.Cond, name string, handler HelmChartStatusHandler) {
+	statusHandler := &helmChartStatusHandler{
+		client:    controller,
+		condition: condition,
+		handler:   handler,
+	}
+	controller.AddGenericHandler(ctx, name, FromHelmChartHandlerToHandler(statusHandler.sync))
+}
+
+func RegisterHelmChartGeneratingHandler(ctx context.Context, controller HelmChartController, apply apply.Apply,
+	condition condition.Cond, name string, handler HelmChartGeneratingHandler, opts *generic.GeneratingHandlerOptions) {
+	statusHandler := &helmChartGeneratingHandler{
+		HelmChartGeneratingHandler: handler,
+		apply:                      apply,
+		name:                       name,
+		gvk:                        controller.GroupVersionKind(),
+	}
+	if opts != nil {
+		statusHandler.opts = *opts
+	}
+	controller.OnChange(ctx, name, statusHandler.Remove)
+	RegisterHelmChartStatusHandler(ctx, controller, condition, name, statusHandler.Handle)
+}
+
+type helmChartStatusHandler struct {
+	client    HelmChartClient
+	condition condition.Cond
+	handler   HelmChartStatusHandler
+}
+
+func (a *helmChartStatusHandler) sync(key string, obj *v1.HelmChart) (*v1.HelmChart, error) {
+	if obj == nil {
+		return obj, nil
+	}
+
+	origStatus := obj.Status.DeepCopy()
+	obj = obj.DeepCopy()
+	newStatus, err := a.handler(obj, obj.Status)
+	if err != nil {
+		// Revert to old status on error
+		newStatus = *origStatus.DeepCopy()
+	}
+
+	if a.condition != "" {
+		if errors.IsConflict(err) {
+			a.condition.SetError(&newStatus, "", nil)
+		} else {
+			a.condition.SetError(&newStatus, "", err)
+		}
+	}
+	if !equality.Semantic.DeepEqual(origStatus, &newStatus) {
+		var newErr error
+		obj.Status = newStatus
+		obj, newErr = a.client.UpdateStatus(obj)
+		if err == nil {
+			err = newErr
+		}
+	}
+	return obj, err
+}
+
+type helmChartGeneratingHandler struct {
+	HelmChartGeneratingHandler
+	apply apply.Apply
+	opts  generic.GeneratingHandlerOptions
+	gvk   schema.GroupVersionKind
+	name  string
+}
+
+func (a *helmChartGeneratingHandler) Remove(key string, obj *v1.HelmChart) (*v1.HelmChart, error) {
+	if obj != nil {
+		return obj, nil
+	}
+
+	obj = &v1.HelmChart{}
+	obj.Namespace, obj.Name = kv.RSplit(key, "/")
+	obj.SetGroupVersionKind(a.gvk)
+
+	return nil, generic.ConfigureApplyForObject(a.apply, obj, &a.opts).
+		WithOwner(obj).
+		WithSetID(a.name).
+		ApplyObjects()
+}
+
+func (a *helmChartGeneratingHandler) Handle(obj *v1.HelmChart, status v1.HelmChartStatus) (v1.HelmChartStatus, error) {
+	objs, newStatus, err := a.HelmChartGeneratingHandler(obj, status)
+	if err != nil {
+		return newStatus, err
+	}
+
+	return newStatus, generic.ConfigureApplyForObject(a.apply, obj, &a.opts).
+		WithOwner(obj).
+		WithSetID(a.name).
+		ApplyObjects(objs...)
 }

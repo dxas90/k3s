@@ -3,7 +3,6 @@
 //go:generate go run pkg/codegen/main.go
 //go:generate go fmt pkg/deploy/zz_generated_bindata.go
 //go:generate go fmt pkg/static/zz_generated_bindata.go
-//go:generate go fmt pkg/openapi/zz_generated_bindata.go
 
 package main
 
@@ -15,8 +14,8 @@ import (
 	"github.com/rancher/k3s/pkg/cli/crictl"
 	"github.com/rancher/k3s/pkg/cli/kubectl"
 	"github.com/rancher/k3s/pkg/cli/server"
+	"github.com/rancher/spur/cli"
 	"github.com/sirupsen/logrus"
-	"github.com/urfave/cli"
 )
 
 func main() {

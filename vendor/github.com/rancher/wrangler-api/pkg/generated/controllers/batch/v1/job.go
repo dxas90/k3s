@@ -20,10 +20,15 @@ package v1
 
 import (
 	"context"
+	"time"
 
+	"github.com/rancher/wrangler/pkg/apply"
+	"github.com/rancher/wrangler/pkg/condition"
 	"github.com/rancher/wrangler/pkg/generic"
+	"github.com/rancher/wrangler/pkg/kv"
 	v1 "k8s.io/api/batch/v1"
 	"k8s.io/apimachinery/pkg/api/equality"
+	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -40,20 +45,15 @@ import (
 type JobHandler func(string, *v1.Job) (*v1.Job, error)
 
 type JobController interface {
+	generic.ControllerMeta
 	JobClient
 
 	OnChange(ctx context.Context, name string, sync JobHandler)
 	OnRemove(ctx context.Context, name string, sync JobHandler)
 	Enqueue(namespace, name string)
+	EnqueueAfter(namespace, name string, duration time.Duration)
 
 	Cache() JobCache
-
-	Informer() cache.SharedIndexInformer
-	GroupVersionKind() schema.GroupVersionKind
-
-	AddGenericHandler(ctx context.Context, name string, handler generic.Handler)
-	AddGenericRemoveHandler(ctx context.Context, name string, handler generic.Handler)
-	Updater() generic.Updater
 }
 
 type JobClient interface {
@@ -118,26 +118,21 @@ func (c *jobController) Updater() generic.Updater {
 	}
 }
 
-func UpdateJobOnChange(updater generic.Updater, handler JobHandler) JobHandler {
-	return func(key string, obj *v1.Job) (*v1.Job, error) {
-		if obj == nil {
-			return handler(key, nil)
-		}
-
-		copyObj := obj.DeepCopy()
-		newObj, err := handler(key, copyObj)
-		if newObj != nil {
-			copyObj = newObj
-		}
-		if obj.ResourceVersion == copyObj.ResourceVersion && !equality.Semantic.DeepEqual(obj, copyObj) {
-			newObj, err := updater(copyObj)
-			if newObj != nil && err == nil {
-				copyObj = newObj.(*v1.Job)
-			}
-		}
-
-		return copyObj, err
+func UpdateJobDeepCopyOnChange(client JobClient, obj *v1.Job, handler func(obj *v1.Job) (*v1.Job, error)) (*v1.Job, error) {
+	if obj == nil {
+		return obj, nil
 	}
+
+	copyObj := obj.DeepCopy()
+	newObj, err := handler(copyObj)
+	if newObj != nil {
+		copyObj = newObj
+	}
+	if obj.ResourceVersion == copyObj.ResourceVersion && !equality.Semantic.DeepEqual(obj, copyObj) {
+		return client.Update(copyObj)
+	}
+
+	return copyObj, err
 }
 
 func (c *jobController) AddGenericHandler(ctx context.Context, name string, handler generic.Handler) {
@@ -162,6 +157,10 @@ func (c *jobController) Enqueue(namespace, name string) {
 	c.controllerManager.Enqueue(c.gvk, c.informer.Informer(), namespace, name)
 }
 
+func (c *jobController) EnqueueAfter(namespace, name string, duration time.Duration) {
+	c.controllerManager.EnqueueAfter(c.gvk, c.informer.Informer(), namespace, name, duration)
+}
+
 func (c *jobController) Informer() cache.SharedIndexInformer {
 	return c.informer.Informer()
 }
@@ -178,35 +177,38 @@ func (c *jobController) Cache() JobCache {
 }
 
 func (c *jobController) Create(obj *v1.Job) (*v1.Job, error) {
-	return c.clientGetter.Jobs(obj.Namespace).Create(obj)
+	return c.clientGetter.Jobs(obj.Namespace).Create(context.TODO(), obj, metav1.CreateOptions{})
 }
 
 func (c *jobController) Update(obj *v1.Job) (*v1.Job, error) {
-	return c.clientGetter.Jobs(obj.Namespace).Update(obj)
+	return c.clientGetter.Jobs(obj.Namespace).Update(context.TODO(), obj, metav1.UpdateOptions{})
 }
 
 func (c *jobController) UpdateStatus(obj *v1.Job) (*v1.Job, error) {
-	return c.clientGetter.Jobs(obj.Namespace).UpdateStatus(obj)
+	return c.clientGetter.Jobs(obj.Namespace).UpdateStatus(context.TODO(), obj, metav1.UpdateOptions{})
 }
 
 func (c *jobController) Delete(namespace, name string, options *metav1.DeleteOptions) error {
-	return c.clientGetter.Jobs(namespace).Delete(name, options)
+	if options == nil {
+		options = &metav1.DeleteOptions{}
+	}
+	return c.clientGetter.Jobs(namespace).Delete(context.TODO(), name, *options)
 }
 
 func (c *jobController) Get(namespace, name string, options metav1.GetOptions) (*v1.Job, error) {
-	return c.clientGetter.Jobs(namespace).Get(name, options)
+	return c.clientGetter.Jobs(namespace).Get(context.TODO(), name, options)
 }
 
 func (c *jobController) List(namespace string, opts metav1.ListOptions) (*v1.JobList, error) {
-	return c.clientGetter.Jobs(namespace).List(opts)
+	return c.clientGetter.Jobs(namespace).List(context.TODO(), opts)
 }
 
 func (c *jobController) Watch(namespace string, opts metav1.ListOptions) (watch.Interface, error) {
-	return c.clientGetter.Jobs(namespace).Watch(opts)
+	return c.clientGetter.Jobs(namespace).Watch(context.TODO(), opts)
 }
 
 func (c *jobController) Patch(namespace, name string, pt types.PatchType, data []byte, subresources ...string) (result *v1.Job, err error) {
-	return c.clientGetter.Jobs(namespace).Patch(name, pt, data, subresources...)
+	return c.clientGetter.Jobs(namespace).Patch(context.TODO(), name, pt, data, metav1.PatchOptions{}, subresources...)
 }
 
 type jobCache struct {
@@ -235,8 +237,109 @@ func (c *jobCache) GetByIndex(indexName, key string) (result []*v1.Job, err erro
 	if err != nil {
 		return nil, err
 	}
+	result = make([]*v1.Job, 0, len(objs))
 	for _, obj := range objs {
 		result = append(result, obj.(*v1.Job))
 	}
 	return result, nil
+}
+
+type JobStatusHandler func(obj *v1.Job, status v1.JobStatus) (v1.JobStatus, error)
+
+type JobGeneratingHandler func(obj *v1.Job, status v1.JobStatus) ([]runtime.Object, v1.JobStatus, error)
+
+func RegisterJobStatusHandler(ctx context.Context, controller JobController, condition condition.Cond, name string, handler JobStatusHandler) {
+	statusHandler := &jobStatusHandler{
+		client:    controller,
+		condition: condition,
+		handler:   handler,
+	}
+	controller.AddGenericHandler(ctx, name, FromJobHandlerToHandler(statusHandler.sync))
+}
+
+func RegisterJobGeneratingHandler(ctx context.Context, controller JobController, apply apply.Apply,
+	condition condition.Cond, name string, handler JobGeneratingHandler, opts *generic.GeneratingHandlerOptions) {
+	statusHandler := &jobGeneratingHandler{
+		JobGeneratingHandler: handler,
+		apply:                apply,
+		name:                 name,
+		gvk:                  controller.GroupVersionKind(),
+	}
+	if opts != nil {
+		statusHandler.opts = *opts
+	}
+	controller.OnChange(ctx, name, statusHandler.Remove)
+	RegisterJobStatusHandler(ctx, controller, condition, name, statusHandler.Handle)
+}
+
+type jobStatusHandler struct {
+	client    JobClient
+	condition condition.Cond
+	handler   JobStatusHandler
+}
+
+func (a *jobStatusHandler) sync(key string, obj *v1.Job) (*v1.Job, error) {
+	if obj == nil {
+		return obj, nil
+	}
+
+	origStatus := obj.Status.DeepCopy()
+	obj = obj.DeepCopy()
+	newStatus, err := a.handler(obj, obj.Status)
+	if err != nil {
+		// Revert to old status on error
+		newStatus = *origStatus.DeepCopy()
+	}
+
+	if a.condition != "" {
+		if errors.IsConflict(err) {
+			a.condition.SetError(&newStatus, "", nil)
+		} else {
+			a.condition.SetError(&newStatus, "", err)
+		}
+	}
+	if !equality.Semantic.DeepEqual(origStatus, &newStatus) {
+		var newErr error
+		obj.Status = newStatus
+		obj, newErr = a.client.UpdateStatus(obj)
+		if err == nil {
+			err = newErr
+		}
+	}
+	return obj, err
+}
+
+type jobGeneratingHandler struct {
+	JobGeneratingHandler
+	apply apply.Apply
+	opts  generic.GeneratingHandlerOptions
+	gvk   schema.GroupVersionKind
+	name  string
+}
+
+func (a *jobGeneratingHandler) Remove(key string, obj *v1.Job) (*v1.Job, error) {
+	if obj != nil {
+		return obj, nil
+	}
+
+	obj = &v1.Job{}
+	obj.Namespace, obj.Name = kv.RSplit(key, "/")
+	obj.SetGroupVersionKind(a.gvk)
+
+	return nil, generic.ConfigureApplyForObject(a.apply, obj, &a.opts).
+		WithOwner(obj).
+		WithSetID(a.name).
+		ApplyObjects()
+}
+
+func (a *jobGeneratingHandler) Handle(obj *v1.Job, status v1.JobStatus) (v1.JobStatus, error) {
+	objs, newStatus, err := a.JobGeneratingHandler(obj, status)
+	if err != nil {
+		return newStatus, err
+	}
+
+	return newStatus, generic.ConfigureApplyForObject(a.apply, obj, &a.opts).
+		WithOwner(obj).
+		WithSetID(a.name).
+		ApplyObjects(objs...)
 }

@@ -24,7 +24,7 @@ import (
 	"k8s.io/apimachinery/pkg/labels"
 	corelisters "k8s.io/client-go/listers/core/v1"
 	"k8s.io/klog"
-	schedulerinternalcache "k8s.io/kubernetes/pkg/scheduler/internal/cache"
+	internalcache "k8s.io/kubernetes/pkg/scheduler/internal/cache"
 	internalqueue "k8s.io/kubernetes/pkg/scheduler/internal/queue"
 	schedulernodeinfo "k8s.io/kubernetes/pkg/scheduler/nodeinfo"
 )
@@ -33,7 +33,7 @@ import (
 type CacheComparer struct {
 	NodeLister corelisters.NodeLister
 	PodLister  corelisters.PodLister
-	Cache      schedulerinternalcache.Cache
+	Cache      internalcache.Cache
 	PodQueue   internalqueue.SchedulingQueue
 }
 
@@ -52,15 +52,15 @@ func (c *CacheComparer) Compare() error {
 		return err
 	}
 
-	snapshot := c.Cache.Snapshot()
+	dump := c.Cache.Dump()
 
 	pendingPods := c.PodQueue.PendingPods()
 
-	if missed, redundant := c.CompareNodes(nodes, snapshot.Nodes); len(missed)+len(redundant) != 0 {
+	if missed, redundant := c.CompareNodes(nodes, dump.Nodes); len(missed)+len(redundant) != 0 {
 		klog.Warningf("cache mismatch: missed nodes: %s; redundant nodes: %s", missed, redundant)
 	}
 
-	if missed, redundant := c.ComparePods(pods, pendingPods, snapshot.Nodes); len(missed)+len(redundant) != 0 {
+	if missed, redundant := c.ComparePods(pods, pendingPods, dump.Nodes); len(missed)+len(redundant) != 0 {
 		klog.Warningf("cache mismatch: missed pods: %s; redundant pods: %s", missed, redundant)
 	}
 

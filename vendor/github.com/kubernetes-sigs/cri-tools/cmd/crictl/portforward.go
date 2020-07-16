@@ -24,33 +24,35 @@ import (
 	"os/signal"
 
 	"github.com/sirupsen/logrus"
-	"github.com/urfave/cli"
+	"github.com/urfave/cli/v2"
 	"golang.org/x/net/context"
 	restclient "k8s.io/client-go/rest"
 	portforward "k8s.io/client-go/tools/portforward"
 	"k8s.io/client-go/transport/spdy"
-	pb "k8s.io/kubernetes/pkg/kubelet/apis/cri/runtime/v1alpha2"
+	pb "k8s.io/cri-api/pkg/apis/runtime/v1alpha2"
 )
 
-var runtimePortForwardCommand = cli.Command{
+var runtimePortForwardCommand = &cli.Command{
 	Name:      "port-forward",
 	Usage:     "Forward local port to a pod",
 	ArgsUsage: "POD-ID [LOCAL_PORT:]REMOTE_PORT",
 	Action: func(context *cli.Context) error {
-		args := context.Args()
+		args := context.Args().Slice()
 		if len(args) < 2 {
 			return cli.ShowSubcommandHelp(context)
 		}
 
-		if err := getRuntimeClient(context); err != nil {
+		runtimeClient, runtimeConn, err := getRuntimeClient(context)
+		if err != nil {
 			return err
 		}
+		defer closeConnection(context, runtimeConn)
 
 		var opts = portforwardOptions{
 			id:    args[0],
 			ports: args[1:],
 		}
-		err := PortForward(runtimeClient, opts)
+		err = PortForward(runtimeClient, opts)
 		if err != nil {
 			return fmt.Errorf("port forward failed: %v", err)
 
@@ -58,7 +60,6 @@ var runtimePortForwardCommand = cli.Command{
 		return nil
 
 	},
-	After: closeConnection,
 }
 
 // PortForward sends an PortForwardRequest to server, and parses the returned PortForwardResponse

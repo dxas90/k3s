@@ -1,6 +1,10 @@
 package version
 
+import "strings"
+
 var (
-	Version   = "dev"
-	GitCommit = "HEAD"
+	Program      = "k3s"
+	ProgramUpper = strings.ToUpper(Program)
+	Version      = "dev"
+	GitCommit    = "HEAD"
 )

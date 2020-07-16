@@ -4,6 +4,7 @@ import (
 	"context"
 	"net"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/rancher/remotedialer"
@@ -20,14 +21,18 @@ func setupTunnel() http.Handler {
 }
 
 func setupProxyDialer(tunnelServer *remotedialer.Server) {
-	app.DefaultProxyDialerFn = utilnet.DialFunc(func(_ context.Context, network, address string) (net.Conn, error) {
+	app.DefaultProxyDialerFn = utilnet.DialFunc(func(ctx context.Context, network, address string) (net.Conn, error) {
 		_, port, _ := net.SplitHostPort(address)
 		addr := "127.0.0.1"
 		if port != "" {
 			addr += ":" + port
 		}
 		nodeName, _ := kv.Split(address, ":")
-		return tunnelServer.Dial(nodeName, 15*time.Second, "tcp", addr)
+		if tunnelServer.HasSession(nodeName) {
+			return tunnelServer.Dial(nodeName, 15*time.Second, "tcp", addr)
+		}
+		var d net.Dialer
+		return d.DialContext(ctx, network, address)
 	})
 }
 
@@ -37,14 +42,9 @@ func authorizer(req *http.Request) (clientKey string, authed bool, err error) {
 		return "", false, nil
 	}
 
-	if user.GetName() != "node" {
-		return "", false, nil
+	if strings.HasPrefix(user.GetName(), "system:node:") {
+		return strings.TrimPrefix(user.GetName(), "system:node:"), true, nil
 	}
 
-	nodeName := req.Header.Get("X-K3s-NodeName")
-	if nodeName == "" {
-		return "", false, nil
-	}
-
-	return nodeName, true, nil
+	return "", false, nil
 }

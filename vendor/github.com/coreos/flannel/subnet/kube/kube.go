@@ -26,7 +26,7 @@ import (
 	"github.com/coreos/flannel/pkg/ip"
 	"github.com/coreos/flannel/subnet"
 	"golang.org/x/net/context"
-	"k8s.io/api/core/v1"
+	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
@@ -38,7 +38,7 @@ import (
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/tools/clientcmd"
-	"k8s.io/klog"
+	log "k8s.io/klog"
 )
 
 var (
@@ -48,8 +48,6 @@ var (
 const (
 	resyncPeriod              = 5 * time.Minute
 	nodeControllerSyncTimeout = 10 * time.Minute
-
-	netConfPath = "/etc/kube-flannel/net-conf.json"
 )
 
 type kubeSubnetManager struct {
@@ -62,21 +60,16 @@ type kubeSubnetManager struct {
 	events         chan subnet.Event
 }
 
-func NewSubnetManager(apiUrl, flannelConf, kubeconfig, prefix string) (subnet.Manager, error) {
+func NewSubnetManager(apiUrl, kubeconfig, prefix, netConfPath string) (subnet.Manager, error) {
 
 	var cfg *rest.Config
 	var err error
-	// Use out of cluster config if the URL or kubeconfig have been specified. Otherwise use incluster config.
-	if apiUrl != "" || kubeconfig != "" {
-		cfg, err = clientcmd.BuildConfigFromFlags(apiUrl, kubeconfig)
-		if err != nil {
-			return nil, fmt.Errorf("unable to create k8s config: %v", err)
-		}
-	} else {
-		cfg, err = rest.InClusterConfig()
-		if err != nil {
-			return nil, fmt.Errorf("unable to initialize inclusterconfig: %v", err)
-		}
+	// Try to build kubernetes config from a master url or a kubeconfig filepath. If neither masterUrl
+	// or kubeconfigPath are passed in we fall back to inClusterConfig. If inClusterConfig fails,
+	// we fallback to the default config.
+	cfg, err = clientcmd.BuildConfigFromFlags(apiUrl, kubeconfig)
+	if err != nil {
+		return nil, fmt.Errorf("fail to create kubernetes config: %v", err)
 	}
 
 	c, err := clientset.NewForConfig(cfg)
@@ -95,7 +88,7 @@ func NewSubnetManager(apiUrl, flannelConf, kubeconfig, prefix string) (subnet.Ma
 			return nil, fmt.Errorf("env variables POD_NAME and POD_NAMESPACE must be set")
 		}
 
-		pod, err := c.CoreV1().Pods(podNamespace).Get(podName, metav1.GetOptions{})
+		pod, err := c.CoreV1().Pods(podNamespace).Get(context.TODO(), podName, metav1.GetOptions{})
 		if err != nil {
 			return nil, fmt.Errorf("error retrieving pod spec for '%s/%s': %v", podNamespace, podName, err)
 		}
@@ -105,10 +98,7 @@ func NewSubnetManager(apiUrl, flannelConf, kubeconfig, prefix string) (subnet.Ma
 		}
 	}
 
-	if flannelConf == "" {
-		flannelConf = netConfPath
-	}
-	netConf, err := ioutil.ReadFile(flannelConf)
+	netConf, err := ioutil.ReadFile(netConfPath)
 	if err != nil {
 		return nil, fmt.Errorf("failed to read net conf: %v", err)
 	}
@@ -124,14 +114,14 @@ func NewSubnetManager(apiUrl, flannelConf, kubeconfig, prefix string) (subnet.Ma
 	}
 	go sm.Run(context.Background())
 
-	klog.Infof("Waiting %s for node controller to sync", nodeControllerSyncTimeout)
+	log.Infof("Waiting %s for node controller to sync", nodeControllerSyncTimeout)
 	err = wait.Poll(time.Second, nodeControllerSyncTimeout, func() (bool, error) {
 		return sm.nodeController.HasSynced(), nil
 	})
 	if err != nil {
 		return nil, fmt.Errorf("error waiting for nodeController to sync state: %v", err)
 	}
-	klog.Infof("Node controller sync successful")
+	log.Infof("Node controller sync successful")
 
 	return sm, nil
 }
@@ -150,10 +140,10 @@ func newKubeSubnetManager(c clientset.Interface, sc *subnet.Config, nodeName, pr
 	indexer, controller := cache.NewIndexerInformer(
 		&cache.ListWatch{
 			ListFunc: func(options metav1.ListOptions) (runtime.Object, error) {
-				return ksm.client.CoreV1().Nodes().List(options)
+				return ksm.client.CoreV1().Nodes().List(context.TODO(), options)
 			},
 			WatchFunc: func(options metav1.ListOptions) (watch.Interface, error) {
-				return ksm.client.CoreV1().Nodes().Watch(options)
+				return ksm.client.CoreV1().Nodes().Watch(context.TODO(), options)
 			},
 		},
 		&v1.Node{},
@@ -169,12 +159,12 @@ func newKubeSubnetManager(c clientset.Interface, sc *subnet.Config, nodeName, pr
 				if !isNode {
 					deletedState, ok := obj.(cache.DeletedFinalStateUnknown)
 					if !ok {
-						klog.Infof("Error received unexpected object: %v", obj)
+						log.Infof("Error received unexpected object: %v", obj)
 						return
 					}
 					node, ok = deletedState.Obj.(*v1.Node)
 					if !ok {
-						klog.Infof("Error deletedFinalStateUnknown contained non-Node object: %v", deletedState.Obj)
+						log.Infof("Error deletedFinalStateUnknown contained non-Node object: %v", deletedState.Obj)
 						return
 					}
 					obj = node
@@ -197,7 +187,7 @@ func (ksm *kubeSubnetManager) handleAddLeaseEvent(et subnet.EventType, obj inter
 
 	l, err := ksm.nodeToLease(*n)
 	if err != nil {
-		klog.Infof("Error turning node %q to lease: %v", n.ObjectMeta.Name, err)
+		log.Infof("Error turning node %q to lease: %v", n.ObjectMeta.Name, err)
 		return
 	}
 	ksm.events <- subnet.Event{et, l}
@@ -217,7 +207,7 @@ func (ksm *kubeSubnetManager) handleUpdateLeaseEvent(oldObj, newObj interface{})
 
 	l, err := ksm.nodeToLease(*n)
 	if err != nil {
-		klog.Infof("Error turning node %q to lease: %v", n.ObjectMeta.Name, err)
+		log.Infof("Error turning node %q to lease: %v", n.ObjectMeta.Name, err)
 		return
 	}
 	ksm.events <- subnet.Event{subnet.EventAdded, l}
@@ -254,7 +244,7 @@ func (ksm *kubeSubnetManager) AcquireLease(ctx context.Context, attrs *subnet.Le
 		n.Annotations[ksm.annotations.BackendData] = string(bd)
 		if n.Annotations[ksm.annotations.BackendPublicIPOverwrite] != "" {
 			if n.Annotations[ksm.annotations.BackendPublicIP] != n.Annotations[ksm.annotations.BackendPublicIPOverwrite] {
-				klog.Infof("Overriding public ip with '%s' from node annotation '%s'",
+				log.Infof("Overriding public ip with '%s' from node annotation '%s'",
 					n.Annotations[ksm.annotations.BackendPublicIPOverwrite],
 					ksm.annotations.BackendPublicIPOverwrite)
 				n.Annotations[ksm.annotations.BackendPublicIP] = n.Annotations[ksm.annotations.BackendPublicIPOverwrite]
@@ -279,10 +269,14 @@ func (ksm *kubeSubnetManager) AcquireLease(ctx context.Context, attrs *subnet.Le
 			return nil, fmt.Errorf("failed to create patch for node %q: %v", ksm.nodeName, err)
 		}
 
-		_, err = ksm.client.CoreV1().Nodes().Patch(ksm.nodeName, types.StrategicMergePatchType, patchBytes, "status")
+		_, err = ksm.client.CoreV1().Nodes().Patch(context.TODO(), ksm.nodeName, types.StrategicMergePatchType, patchBytes, metav1.PatchOptions{}, "status")
 		if err != nil {
 			return nil, err
 		}
+	}
+	err = ksm.setNodeNetworkUnavailableFalse()
+	if err != nil {
+		log.Errorf("Unable to set NetworkUnavailable to False for %q: %v", ksm.nodeName, err)
 	}
 	return &subnet.Lease{
 		Subnet:     ip.FromIPNet(cidr),
@@ -303,7 +297,7 @@ func (ksm *kubeSubnetManager) WatchLeases(ctx context.Context, cursor interface{
 }
 
 func (ksm *kubeSubnetManager) Run(ctx context.Context) {
-	klog.Infof("Starting kube subnet manager")
+	log.Infof("Starting kube subnet manager")
 	ksm.nodeController.Run(ctx.Done())
 }
 
@@ -325,7 +319,7 @@ func (ksm *kubeSubnetManager) nodeToLease(n v1.Node) (l subnet.Lease, err error)
 	return l, nil
 }
 
-// unimplemented
+// RenewLease: unimplemented
 func (ksm *kubeSubnetManager) RenewLease(ctx context.Context, lease *subnet.Lease) error {
 	return ErrUnimplemented
 }
@@ -336,4 +330,24 @@ func (ksm *kubeSubnetManager) WatchLease(ctx context.Context, sn ip.IP4Net, curs
 
 func (ksm *kubeSubnetManager) Name() string {
 	return fmt.Sprintf("Kubernetes Subnet Manager - %s", ksm.nodeName)
+}
+
+// Set Kubernetes NodeNetworkUnavailable to false when starting
+// https://kubernetes.io/docs/concepts/architecture/nodes/#condition
+func (ksm *kubeSubnetManager) setNodeNetworkUnavailableFalse() error {
+	condition := v1.NodeCondition{
+		Type:               v1.NodeNetworkUnavailable,
+		Status:             v1.ConditionFalse,
+		Reason:             "FlannelIsUp",
+		Message:            "Flannel is running on this node",
+		LastTransitionTime: metav1.Now(),
+		LastHeartbeatTime:  metav1.Now(),
+	}
+	raw, err := json.Marshal(&[]v1.NodeCondition{condition})
+	if err != nil {
+		return err
+	}
+	patch := []byte(fmt.Sprintf(`{"status":{"conditions":%s}}`, raw))
+	_, err = ksm.client.CoreV1().Nodes().PatchStatus(context.TODO(), ksm.nodeName, patch)
+	return err
 }

@@ -7,20 +7,30 @@ assignees: ''
 
 ---
 
-Thanks for helping us to improve k3s! We welcome all bug reports. At this stage, we are also looking for help in testing/QAing fixes. Once we've fixed you're issue, we'll ping you in the comments to see if you can verify the fix. We'll give you details on what version can be used to test the fix. Additionally, if you are interested in testing fixes that you ***didn't*** report, look for the issues with the `status/to-test` label. You can pick any of these up for verification.  ***You can delete this message portion of the bug report.***
+<!-- Thanks for helping us to improve K3s! We welcome all bug reports. Please fill out each area of the template so we can better help you. Comments like this will be hidden when you post but you can delete them if you wish. -->
 
-**Describe the bug**
-A clear and concise description of what the bug is.
+**Environmental Info:**
+K3s Version: 
+<!-- Provide the output from "k3s -v" -->
 
-**To Reproduce**
-Steps to reproduce the behavior:
+Node(s) CPU architecture, OS, and Version: 
+<!-- Provide the output from "uname -a" on the node(s) -->
 
-**Expected behavior**
-A clear and concise description of what you expected to happen.
+Cluster Configuration:
+<!-- Provide some basic information on the cluster configuration. For example, "3 masters, 2 workers". -->
 
-**Screenshots**
-If applicable, add screenshots to help explain your problem.
+**Describe the bug:**
+<!-- A clear and concise description of what the bug is. -->
 
+**Steps To Reproduce:**
+<!-- Steps to reproduce the behavior. Please include as the first step how you installed K3s on the node(s) (including all flags or environment variables). If you have customized configuration via systemd drop-ins or overrides (https://coreos.com/os/docs/latest/using-systemd-drop-in-units.html) please include those as well. -->
+- Installed K3s: 
 
-**Additional context**
-Add any other context about the problem here.
+**Expected behavior:**
+<!-- A clear and concise description of what you expected to happen. -->
+
+**Actual behavior:**
+<!-- A clear and concise description of what actually happened. -->
+
+**Additional context / logs:**
+<!-- Add any other context and/or logs about the problem here. -->

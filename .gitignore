@@ -1,5 +1,6 @@
 *.swp
 /.dapper
+/.tags
 /.idea
 /.trash-cache
 /.vagrant
@@ -11,6 +12,7 @@
 /.lesshst
 /*.log
 /bin
+/etc
 /build
 /data-dir
 /dist
@@ -26,3 +28,4 @@ __pycache__
 /tests/.tox/
 /tests/.vscode
 /sonobuoy-output
+*.tmp

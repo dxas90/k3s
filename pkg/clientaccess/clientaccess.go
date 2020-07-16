@@ -9,7 +9,6 @@ import (
 	"io/ioutil"
 	"net/http"
 	"net/url"
-	"os"
 	"strings"
 
 	"github.com/pkg/errors"
@@ -35,56 +34,31 @@ type clientToken struct {
 	password string
 }
 
-func AgentAccessInfoToTempKubeConfig(tempDir, server, token string) (string, error) {
-	f, err := ioutil.TempFile(tempDir, "tmp-")
+func WriteClientKubeConfig(destFile, url, serverCAFile, clientCertFile, clientKeyFile string) error {
+	serverCA, err := ioutil.ReadFile(serverCAFile)
 	if err != nil {
-		return "", err
+		return errors.Wrapf(err, "failed to read %s", serverCAFile)
 	}
-	if err := f.Close(); err != nil {
-		return "", err
-	}
-	err = accessInfoToKubeConfig(f.Name(), server, token)
+
+	clientCert, err := ioutil.ReadFile(clientCertFile)
 	if err != nil {
-		os.Remove(f.Name())
+		return errors.Wrapf(err, "failed to read %s", clientCertFile)
 	}
-	return f.Name(), err
-}
 
-func AgentAccessInfoToKubeConfig(destFile, server, token string) error {
-	return accessInfoToKubeConfig(destFile, server, token)
-}
+	clientKey, err := ioutil.ReadFile(clientKeyFile)
+	if err != nil {
+		return errors.Wrapf(err, "failed to read %s", clientKeyFile)
+	}
 
-type Info struct {
-	URL      string `json:"url,omitempty"`
-	CACerts  []byte `json:"cacerts,omitempty"`
-	username string
-	password string
-	Token    string `json:"token,omitempty"`
-}
-
-func (i *Info) WriteKubeConfig(destFile string) error {
-	return clientcmd.WriteToFile(*i.KubeConfig(), destFile)
-}
-
-func (i *Info) KubeConfig() *clientcmdapi.Config {
 	config := clientcmdapi.NewConfig()
 
 	cluster := clientcmdapi.NewCluster()
-	cluster.CertificateAuthorityData = i.CACerts
-	cluster.Server = i.URL
+	cluster.CertificateAuthorityData = serverCA
+	cluster.Server = url
 
 	authInfo := clientcmdapi.NewAuthInfo()
-	if i.password != "" {
-		authInfo.Username = i.username
-		authInfo.Password = i.password
-	} else if i.Token != "" {
-		if username, pass, ok := ParseUsernamePassword(i.Token); ok {
-			authInfo.Username = username
-			authInfo.Password = pass
-		} else {
-			authInfo.Token = i.Token
-		}
-	}
+	authInfo.ClientCertificateData = clientCert
+	authInfo.ClientKeyData = clientKey
 
 	context := clientcmdapi.NewContext()
 	context.AuthInfo = "default"
@@ -95,7 +69,35 @@ func (i *Info) KubeConfig() *clientcmdapi.Config {
 	config.Contexts["default"] = context
 	config.CurrentContext = "default"
 
-	return config
+	return clientcmd.WriteToFile(*config, destFile)
+}
+
+type Info struct {
+	URL      string `json:"url,omitempty"`
+	CACerts  []byte `json:"cacerts,omitempty"`
+	username string
+	password string
+	Token    string `json:"token,omitempty"`
+}
+
+func (i *Info) ToToken() string {
+	return fmt.Sprintf("K10%s::%s:%s", hashCA(i.CACerts), i.username, i.password)
+}
+
+func NormalizeAndValidateTokenForUser(server, token, user string) (string, error) {
+	if !strings.HasPrefix(token, "K10") {
+		token = "K10::" + user + ":" + token
+	}
+	info, err := ParseAndValidateToken(server, token)
+	if err != nil {
+		return "", err
+	}
+
+	if info.username != user {
+		info.username = user
+	}
+
+	return info.ToToken(), nil
 }
 
 func ParseAndValidateToken(server, token string) (*Info, error) {
@@ -132,26 +134,21 @@ func ParseAndValidateToken(server, token string) (*Info, error) {
 		return nil, err
 	}
 
-	return &Info{
+	i := &Info{
 		URL:      url.String(),
 		CACerts:  cacerts,
 		username: parsedToken.username,
 		password: parsedToken.password,
 		Token:    token,
-	}, nil
-}
-
-func accessInfoToKubeConfig(destFile, server, token string) error {
-	info, err := ParseAndValidateToken(server, token)
-	if err != nil {
-		return err
 	}
 
-	return info.WriteKubeConfig(destFile)
+	// normalize token
+	i.Token = i.ToToken()
+	return i, nil
 }
 
 func validateToken(u url.URL, cacerts []byte, username, password string) error {
-	u.Path = "/apis"
+	u.Path = "/cacerts"
 	_, err := get(u.String(), GetHTTPClient(cacerts), username, password)
 	if err != nil {
 		return errors.Wrap(err, "token is not valid")
@@ -164,9 +161,13 @@ func validateCACerts(cacerts []byte, hash string) (bool, string, string) {
 		return true, "", ""
 	}
 
-	digest := sha256.Sum256([]byte(cacerts))
-	newHash := hex.EncodeToString(digest[:])
+	newHash := hashCA(cacerts)
 	return hash == newHash, hash, newHash
+}
+
+func hashCA(cacerts []byte) string {
+	digest := sha256.Sum256(cacerts)
+	return hex.EncodeToString(digest[:])
 }
 
 func ParseUsernamePassword(token string) (string, string, bool) {

@@ -3,17 +3,17 @@ package tunnel
 import (
 	"context"
 	"crypto/tls"
-	"crypto/x509"
-	"encoding/base64"
 	"fmt"
 	"net"
-	"net/http"
 	"reflect"
+	"strconv"
 	"sync"
 	"time"
 
 	"github.com/gorilla/websocket"
+	"github.com/rancher/k3s/pkg/agent/proxy"
 	"github.com/rancher/k3s/pkg/daemons/config"
+	"github.com/rancher/k3s/pkg/version"
 	"github.com/rancher/remotedialer"
 	"github.com/sirupsen/logrus"
 	v1 "k8s.io/api/core/v1"
@@ -21,8 +21,8 @@ import (
 	"k8s.io/apimachinery/pkg/fields"
 	watchtypes "k8s.io/apimachinery/pkg/watch"
 	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
-	"k8s.io/client-go/transport"
 )
 
 var (
@@ -40,26 +40,20 @@ func getAddresses(endpoint *v1.Endpoints) []string {
 	for _, subset := range endpoint.Subsets {
 		var port string
 		if len(subset.Ports) > 0 {
-			port = fmt.Sprint(subset.Ports[0].Port)
+			port = strconv.Itoa(int(subset.Ports[0].Port))
+		}
+		if port == "" {
+			port = "443"
 		}
 		for _, address := range subset.Addresses {
-			serverAddress := address.IP
-			if port != "" {
-				serverAddress += ":" + port
-			}
-			serverAddresses = append(serverAddresses, serverAddress)
+			serverAddresses = append(serverAddresses, net.JoinHostPort(address.IP, port))
 		}
 	}
 	return serverAddresses
 }
 
-func Setup(ctx context.Context, config *config.Node, onChange func([]string)) error {
-	restConfig, err := clientcmd.BuildConfigFromFlags("", config.AgentConfig.KubeConfigNode)
-	if err != nil {
-		return err
-	}
-
-	transportConfig, err := restConfig.TransportConfig()
+func Setup(ctx context.Context, config *config.Node, proxy proxy.Proxy) error {
+	restConfig, err := clientcmd.BuildConfigFromFlags("", config.AgentConfig.KubeConfigK3sController)
 	if err != nil {
 		return err
 	}
@@ -69,22 +63,27 @@ func Setup(ctx context.Context, config *config.Node, onChange func([]string)) er
 		return err
 	}
 
-	addresses := []string{config.ServerAddress}
+	nodeRestConfig, err := clientcmd.BuildConfigFromFlags("", config.AgentConfig.KubeConfigKubelet)
+	if err != nil {
+		return err
+	}
 
-	endpoint, _ := client.CoreV1().Endpoints("default").Get("kubernetes", metav1.GetOptions{})
+	tlsConfig, err := rest.TLSConfigFor(nodeRestConfig)
+	if err != nil {
+		return err
+	}
+
+	endpoint, _ := client.CoreV1().Endpoints("default").Get(ctx, "kubernetes", metav1.GetOptions{})
 	if endpoint != nil {
-		addresses = getAddresses(endpoint)
-		if onChange != nil {
-			onChange(addresses)
-		}
+		proxy.Update(getAddresses(endpoint))
 	}
 
 	disconnect := map[string]context.CancelFunc{}
 
 	wg := &sync.WaitGroup{}
-	for _, address := range addresses {
+	for _, address := range proxy.SupervisorAddresses() {
 		if _, ok := disconnect[address]; !ok {
-			disconnect[address] = connect(ctx, wg, address, config, transportConfig)
+			disconnect[address] = connect(ctx, wg, address, tlsConfig)
 		}
 	}
 
@@ -92,7 +91,7 @@ func Setup(ctx context.Context, config *config.Node, onChange func([]string)) er
 	connect:
 		for {
 			time.Sleep(5 * time.Second)
-			watch, err := client.CoreV1().Endpoints("default").Watch(metav1.ListOptions{
+			watch, err := client.CoreV1().Endpoints("default").Watch(ctx, metav1.ListOptions{
 				FieldSelector:   fields.Set{"metadata.name": "kubernetes"}.String(),
 				ResourceVersion: "0",
 			})
@@ -118,21 +117,17 @@ func Setup(ctx context.Context, config *config.Node, onChange func([]string)) er
 					}
 
 					newAddresses := getAddresses(endpoint)
-					if reflect.DeepEqual(newAddresses, addresses) {
+					if reflect.DeepEqual(newAddresses, proxy.SupervisorAddresses()) {
 						continue watching
 					}
-					addresses = newAddresses
-					logrus.Infof("Tunnel endpoint watch event: %v", addresses)
-					if onChange != nil {
-						onChange(addresses)
-					}
+					proxy.Update(newAddresses)
 
 					validEndpoint := map[string]bool{}
 
-					for _, address := range addresses {
+					for _, address := range proxy.SupervisorAddresses() {
 						validEndpoint[address] = true
 						if _, ok := disconnect[address]; !ok {
-							disconnect[address] = connect(ctx, nil, address, config, transportConfig)
+							disconnect[address] = connect(ctx, nil, address, tlsConfig)
 						}
 					}
 
@@ -164,25 +159,10 @@ func Setup(ctx context.Context, config *config.Node, onChange func([]string)) er
 	return nil
 }
 
-func connect(rootCtx context.Context, waitGroup *sync.WaitGroup, address string, config *config.Node, transportConfig *transport.Config) context.CancelFunc {
-	wsURL := fmt.Sprintf("wss://%s/v1-k3s/connect", address)
-	headers := map[string][]string{
-		"X-K3s-NodeName": {config.AgentConfig.NodeName},
-	}
-	ws := &websocket.Dialer{}
-
-	if len(config.CACerts) > 0 {
-		pool := x509.NewCertPool()
-		pool.AppendCertsFromPEM(config.CACerts)
-		ws.TLSClientConfig = &tls.Config{
-			RootCAs: pool,
-		}
-	}
-
-	if transportConfig.Username != "" {
-		auth := transportConfig.Username + ":" + transportConfig.Password
-		auth = base64.StdEncoding.EncodeToString([]byte(auth))
-		headers["Authorization"] = []string{"Basic " + auth}
+func connect(rootCtx context.Context, waitGroup *sync.WaitGroup, address string, tlsConfig *tls.Config) context.CancelFunc {
+	wsURL := fmt.Sprintf("wss://%s/v1-"+version.Program+"/connect", address)
+	ws := &websocket.Dialer{
+		TLSClientConfig: tlsConfig,
 	}
 
 	once := sync.Once{}
@@ -194,7 +174,7 @@ func connect(rootCtx context.Context, waitGroup *sync.WaitGroup, address string,
 
 	go func() {
 		for {
-			remotedialer.ClientConnect(ctx, wsURL, http.Header(headers), ws, func(proto, address string) bool {
+			remotedialer.ClientConnect(ctx, wsURL, nil, ws, func(proto, address string) bool {
 				host, port, err := net.SplitHostPort(address)
 				return err == nil && proto == "tcp" && ports[port] && host == "127.0.0.1"
 			}, func(_ context.Context) error {

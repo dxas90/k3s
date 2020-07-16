@@ -18,6 +18,7 @@ package passwordfile
 
 import (
 	"context"
+	"crypto/subtle"
 	"encoding/csv"
 	"fmt"
 	"io"
@@ -30,6 +31,7 @@ import (
 	"k8s.io/apiserver/pkg/authentication/user"
 )
 
+// PasswordAuthenticator authenticates users by password
 type PasswordAuthenticator struct {
 	users map[string]*userPasswordInfo
 }
@@ -80,12 +82,13 @@ func NewCSV(path string) (*PasswordAuthenticator, error) {
 	return &PasswordAuthenticator{users}, nil
 }
 
+// AuthenticatePassword returns user info if authentication is successful, nil otherwise
 func (a *PasswordAuthenticator) AuthenticatePassword(ctx context.Context, username, password string) (*authenticator.Response, bool, error) {
 	user, ok := a.users[username]
 	if !ok {
 		return nil, false, nil
 	}
-	if user.password != password {
+	if subtle.ConstantTimeCompare([]byte(user.password), []byte(password)) == 0 {
 		return nil, false, nil
 	}
 	return &authenticator.Response{User: user.info}, true, nil

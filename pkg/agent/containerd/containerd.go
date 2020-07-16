@@ -1,6 +1,7 @@
 package containerd
 
 import (
+	"bufio"
 	"context"
 	"fmt"
 	"io"
@@ -8,19 +9,22 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"syscall"
+	"strings"
 	"time"
 
 	"github.com/containerd/containerd"
 	"github.com/containerd/containerd/namespaces"
 	"github.com/natefinch/lumberjack"
 	"github.com/opencontainers/runc/libcontainer/system"
+	"github.com/pkg/errors"
 	"github.com/rancher/k3s/pkg/agent/templates"
 	util2 "github.com/rancher/k3s/pkg/agent/util"
 	"github.com/rancher/k3s/pkg/daemons/config"
+	"github.com/rancher/k3s/pkg/version"
 	"github.com/sirupsen/logrus"
 	"google.golang.org/grpc"
-	runtimeapi "k8s.io/kubernetes/pkg/kubelet/apis/cri/runtime/v1alpha2"
+	yaml "gopkg.in/yaml.v2"
+	runtimeapi "k8s.io/cri-api/pkg/apis/runtime/v1alpha2"
 	"k8s.io/kubernetes/pkg/kubelet/util"
 )
 
@@ -65,39 +69,25 @@ func Run(ctx context.Context, cfg *config.Node) error {
 		cmd := exec.Command(args[0], args[1:]...)
 		cmd.Stdout = stdOut
 		cmd.Stderr = stdErr
-		cmd.SysProcAttr = &syscall.SysProcAttr{
-			Pdeathsig: syscall.SIGKILL,
-		}
+		addDeathSig(cmd)
 		if err := cmd.Run(); err != nil {
 			fmt.Fprintf(os.Stderr, "containerd: %s\n", err)
 		}
 		os.Exit(1)
 	}()
 
+	first := true
 	for {
-		addr, dailer, err := util.GetAddressAndDialer("unix://" + cfg.Containerd.Address)
-		if err != nil {
-			time.Sleep(1 * time.Second)
-			continue
-		}
-
-		conn, err := grpc.Dial(addr, grpc.WithInsecure(), grpc.WithTimeout(3*time.Second), grpc.WithDialer(dailer), grpc.WithDefaultCallOptions(grpc.MaxCallRecvMsgSize(maxMsgSize)))
-		if err != nil {
-			time.Sleep(1 * time.Second)
-			continue
-		}
-
-		c := runtimeapi.NewRuntimeServiceClient(conn)
-
-		_, err = c.Version(ctx, &runtimeapi.VersionRequest{
-			Version: "0.1.0",
-		})
+		conn, err := criConnection(ctx, cfg.Containerd.Address)
 		if err == nil {
 			conn.Close()
 			break
 		}
-		conn.Close()
-		logrus.Infof("Waiting for containerd startup: %v", err)
+		if first {
+			first = false
+		} else {
+			logrus.Infof("Waiting for containerd startup: %v", err)
+		}
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
@@ -105,10 +95,33 @@ func Run(ctx context.Context, cfg *config.Node) error {
 		}
 	}
 
-	return preloadImages(cfg)
+	return preloadImages(ctx, cfg)
 }
 
-func preloadImages(cfg *config.Node) error {
+func criConnection(ctx context.Context, address string) (*grpc.ClientConn, error) {
+	addr, dialer, err := util.GetAddressAndDialer("unix://" + address)
+	if err != nil {
+		return nil, err
+	}
+
+	conn, err := grpc.Dial(addr, grpc.WithInsecure(), grpc.WithTimeout(3*time.Second), grpc.WithContextDialer(dialer), grpc.WithDefaultCallOptions(grpc.MaxCallRecvMsgSize(maxMsgSize)))
+	if err != nil {
+		return nil, err
+	}
+
+	c := runtimeapi.NewRuntimeServiceClient(conn)
+	_, err = c.Version(ctx, &runtimeapi.VersionRequest{
+		Version: "0.1.0",
+	})
+	if err != nil {
+		conn.Close()
+		return nil, err
+	}
+
+	return conn, nil
+}
+
+func preloadImages(ctx context.Context, cfg *config.Node) error {
 	fileInfo, err := os.Stat(cfg.Images)
 	if os.IsNotExist(err) {
 		return nil
@@ -133,6 +146,12 @@ func preloadImages(cfg *config.Node) error {
 	}
 	defer client.Close()
 
+	criConn, err := criConnection(ctx, cfg.Containerd.Address)
+	if err != nil {
+		return err
+	}
+	defer criConn.Close()
+
 	ctxContainerD := namespaces.WithNamespace(context.Background(), "k8s.io")
 
 	for _, fileInfo := range fileInfos {
@@ -148,8 +167,15 @@ func preloadImages(cfg *config.Node) error {
 			continue
 		}
 
+		if strings.HasSuffix(fileInfo.Name(), ".txt") {
+			prePullImages(ctx, criConn, file)
+			file.Close()
+			continue
+		}
+
 		logrus.Debugf("Import %s", filePath)
 		_, err = client.Import(ctxContainerD, file)
+		file.Close()
 		if err != nil {
 			logrus.Errorf("Unable to import %s: %v", filePath, err)
 		}
@@ -157,11 +183,58 @@ func preloadImages(cfg *config.Node) error {
 	return nil
 }
 
+func prePullImages(ctx context.Context, conn *grpc.ClientConn, images io.Reader) {
+	imageClient := runtimeapi.NewImageServiceClient(conn)
+	scanner := bufio.NewScanner(images)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		resp, err := imageClient.ImageStatus(ctx, &runtimeapi.ImageStatusRequest{
+			Image: &runtimeapi.ImageSpec{
+				Image: line,
+			},
+		})
+		if err == nil && resp.Image != nil {
+			continue
+		}
+
+		logrus.Infof("Pulling image %s...", line)
+		_, err = imageClient.PullImage(ctx, &runtimeapi.PullImageRequest{
+			Image: &runtimeapi.ImageSpec{
+				Image: line,
+			},
+		})
+		if err != nil {
+			logrus.Errorf("Failed to pull %s: %v", line, err)
+		}
+	}
+}
+
 func setupContainerdConfig(ctx context.Context, cfg *config.Node) error {
+	privRegistries, err := getPrivateRegistries(ctx, cfg)
+	if err != nil {
+		return err
+	}
 	var containerdTemplate string
 	containerdConfig := templates.ContainerdConfig{
-		NodeConfig:        cfg,
-		IsRunningInUserNS: system.RunningInUserNS(),
+		NodeConfig:            cfg,
+		IsRunningInUserNS:     system.RunningInUserNS(),
+		PrivateRegistryConfig: privRegistries,
+	}
+
+	selEnabled, selConfigured, err := selinuxStatus()
+	if err != nil {
+		return errors.Wrap(err, "failed to detect selinux")
+	}
+	if cfg.DisableSELinux {
+		containerdConfig.SELinuxEnabled = false
+		if selEnabled {
+			logrus.Warn("SELinux is enabled for system but has been disabled for containerd by override")
+		}
+	} else {
+		containerdConfig.SELinuxEnabled = selEnabled
+	}
+	if containerdConfig.SELinuxEnabled && !selConfigured {
+		logrus.Warnf("SELinux is enabled for "+version.Program+" but process is not running in context '%s', "+version.Program+"-selinux policy may need to be applied", SELinuxContextType)
 	}
 
 	containerdTemplateBytes, err := ioutil.ReadFile(cfg.Containerd.Template)
@@ -179,4 +252,20 @@ func setupContainerdConfig(ctx context.Context, cfg *config.Node) error {
 	}
 
 	return util2.WriteFile(cfg.Containerd.Config, parsedTemplate)
+}
+
+func getPrivateRegistries(ctx context.Context, cfg *config.Node) (*templates.Registry, error) {
+	privRegistries := &templates.Registry{}
+	privRegistryFile, err := ioutil.ReadFile(cfg.AgentConfig.PrivateRegistry)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	logrus.Infof("Using registry config file at %s", cfg.AgentConfig.PrivateRegistry)
+	if err := yaml.Unmarshal(privRegistryFile, &privRegistries); err != nil {
+		return nil, err
+	}
+	return privRegistries, nil
 }

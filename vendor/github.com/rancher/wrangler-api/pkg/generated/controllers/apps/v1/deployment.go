@@ -20,10 +20,15 @@ package v1
 
 import (
 	"context"
+	"time"
 
+	"github.com/rancher/wrangler/pkg/apply"
+	"github.com/rancher/wrangler/pkg/condition"
 	"github.com/rancher/wrangler/pkg/generic"
+	"github.com/rancher/wrangler/pkg/kv"
 	v1 "k8s.io/api/apps/v1"
 	"k8s.io/apimachinery/pkg/api/equality"
+	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -40,20 +45,15 @@ import (
 type DeploymentHandler func(string, *v1.Deployment) (*v1.Deployment, error)
 
 type DeploymentController interface {
+	generic.ControllerMeta
 	DeploymentClient
 
 	OnChange(ctx context.Context, name string, sync DeploymentHandler)
 	OnRemove(ctx context.Context, name string, sync DeploymentHandler)
 	Enqueue(namespace, name string)
+	EnqueueAfter(namespace, name string, duration time.Duration)
 
 	Cache() DeploymentCache
-
-	Informer() cache.SharedIndexInformer
-	GroupVersionKind() schema.GroupVersionKind
-
-	AddGenericHandler(ctx context.Context, name string, handler generic.Handler)
-	AddGenericRemoveHandler(ctx context.Context, name string, handler generic.Handler)
-	Updater() generic.Updater
 }
 
 type DeploymentClient interface {
@@ -118,26 +118,21 @@ func (c *deploymentController) Updater() generic.Updater {
 	}
 }
 
-func UpdateDeploymentOnChange(updater generic.Updater, handler DeploymentHandler) DeploymentHandler {
-	return func(key string, obj *v1.Deployment) (*v1.Deployment, error) {
-		if obj == nil {
-			return handler(key, nil)
-		}
-
-		copyObj := obj.DeepCopy()
-		newObj, err := handler(key, copyObj)
-		if newObj != nil {
-			copyObj = newObj
-		}
-		if obj.ResourceVersion == copyObj.ResourceVersion && !equality.Semantic.DeepEqual(obj, copyObj) {
-			newObj, err := updater(copyObj)
-			if newObj != nil && err == nil {
-				copyObj = newObj.(*v1.Deployment)
-			}
-		}
-
-		return copyObj, err
+func UpdateDeploymentDeepCopyOnChange(client DeploymentClient, obj *v1.Deployment, handler func(obj *v1.Deployment) (*v1.Deployment, error)) (*v1.Deployment, error) {
+	if obj == nil {
+		return obj, nil
 	}
+
+	copyObj := obj.DeepCopy()
+	newObj, err := handler(copyObj)
+	if newObj != nil {
+		copyObj = newObj
+	}
+	if obj.ResourceVersion == copyObj.ResourceVersion && !equality.Semantic.DeepEqual(obj, copyObj) {
+		return client.Update(copyObj)
+	}
+
+	return copyObj, err
 }
 
 func (c *deploymentController) AddGenericHandler(ctx context.Context, name string, handler generic.Handler) {
@@ -162,6 +157,10 @@ func (c *deploymentController) Enqueue(namespace, name string) {
 	c.controllerManager.Enqueue(c.gvk, c.informer.Informer(), namespace, name)
 }
 
+func (c *deploymentController) EnqueueAfter(namespace, name string, duration time.Duration) {
+	c.controllerManager.EnqueueAfter(c.gvk, c.informer.Informer(), namespace, name, duration)
+}
+
 func (c *deploymentController) Informer() cache.SharedIndexInformer {
 	return c.informer.Informer()
 }
@@ -178,35 +177,38 @@ func (c *deploymentController) Cache() DeploymentCache {
 }
 
 func (c *deploymentController) Create(obj *v1.Deployment) (*v1.Deployment, error) {
-	return c.clientGetter.Deployments(obj.Namespace).Create(obj)
+	return c.clientGetter.Deployments(obj.Namespace).Create(context.TODO(), obj, metav1.CreateOptions{})
 }
 
 func (c *deploymentController) Update(obj *v1.Deployment) (*v1.Deployment, error) {
-	return c.clientGetter.Deployments(obj.Namespace).Update(obj)
+	return c.clientGetter.Deployments(obj.Namespace).Update(context.TODO(), obj, metav1.UpdateOptions{})
 }
 
 func (c *deploymentController) UpdateStatus(obj *v1.Deployment) (*v1.Deployment, error) {
-	return c.clientGetter.Deployments(obj.Namespace).UpdateStatus(obj)
+	return c.clientGetter.Deployments(obj.Namespace).UpdateStatus(context.TODO(), obj, metav1.UpdateOptions{})
 }
 
 func (c *deploymentController) Delete(namespace, name string, options *metav1.DeleteOptions) error {
-	return c.clientGetter.Deployments(namespace).Delete(name, options)
+	if options == nil {
+		options = &metav1.DeleteOptions{}
+	}
+	return c.clientGetter.Deployments(namespace).Delete(context.TODO(), name, *options)
 }
 
 func (c *deploymentController) Get(namespace, name string, options metav1.GetOptions) (*v1.Deployment, error) {
-	return c.clientGetter.Deployments(namespace).Get(name, options)
+	return c.clientGetter.Deployments(namespace).Get(context.TODO(), name, options)
 }
 
 func (c *deploymentController) List(namespace string, opts metav1.ListOptions) (*v1.DeploymentList, error) {
-	return c.clientGetter.Deployments(namespace).List(opts)
+	return c.clientGetter.Deployments(namespace).List(context.TODO(), opts)
 }
 
 func (c *deploymentController) Watch(namespace string, opts metav1.ListOptions) (watch.Interface, error) {
-	return c.clientGetter.Deployments(namespace).Watch(opts)
+	return c.clientGetter.Deployments(namespace).Watch(context.TODO(), opts)
 }
 
 func (c *deploymentController) Patch(namespace, name string, pt types.PatchType, data []byte, subresources ...string) (result *v1.Deployment, err error) {
-	return c.clientGetter.Deployments(namespace).Patch(name, pt, data, subresources...)
+	return c.clientGetter.Deployments(namespace).Patch(context.TODO(), name, pt, data, metav1.PatchOptions{}, subresources...)
 }
 
 type deploymentCache struct {
@@ -235,8 +237,109 @@ func (c *deploymentCache) GetByIndex(indexName, key string) (result []*v1.Deploy
 	if err != nil {
 		return nil, err
 	}
+	result = make([]*v1.Deployment, 0, len(objs))
 	for _, obj := range objs {
 		result = append(result, obj.(*v1.Deployment))
 	}
 	return result, nil
+}
+
+type DeploymentStatusHandler func(obj *v1.Deployment, status v1.DeploymentStatus) (v1.DeploymentStatus, error)
+
+type DeploymentGeneratingHandler func(obj *v1.Deployment, status v1.DeploymentStatus) ([]runtime.Object, v1.DeploymentStatus, error)
+
+func RegisterDeploymentStatusHandler(ctx context.Context, controller DeploymentController, condition condition.Cond, name string, handler DeploymentStatusHandler) {
+	statusHandler := &deploymentStatusHandler{
+		client:    controller,
+		condition: condition,
+		handler:   handler,
+	}
+	controller.AddGenericHandler(ctx, name, FromDeploymentHandlerToHandler(statusHandler.sync))
+}
+
+func RegisterDeploymentGeneratingHandler(ctx context.Context, controller DeploymentController, apply apply.Apply,
+	condition condition.Cond, name string, handler DeploymentGeneratingHandler, opts *generic.GeneratingHandlerOptions) {
+	statusHandler := &deploymentGeneratingHandler{
+		DeploymentGeneratingHandler: handler,
+		apply:                       apply,
+		name:                        name,
+		gvk:                         controller.GroupVersionKind(),
+	}
+	if opts != nil {
+		statusHandler.opts = *opts
+	}
+	controller.OnChange(ctx, name, statusHandler.Remove)
+	RegisterDeploymentStatusHandler(ctx, controller, condition, name, statusHandler.Handle)
+}
+
+type deploymentStatusHandler struct {
+	client    DeploymentClient
+	condition condition.Cond
+	handler   DeploymentStatusHandler
+}
+
+func (a *deploymentStatusHandler) sync(key string, obj *v1.Deployment) (*v1.Deployment, error) {
+	if obj == nil {
+		return obj, nil
+	}
+
+	origStatus := obj.Status.DeepCopy()
+	obj = obj.DeepCopy()
+	newStatus, err := a.handler(obj, obj.Status)
+	if err != nil {
+		// Revert to old status on error
+		newStatus = *origStatus.DeepCopy()
+	}
+
+	if a.condition != "" {
+		if errors.IsConflict(err) {
+			a.condition.SetError(&newStatus, "", nil)
+		} else {
+			a.condition.SetError(&newStatus, "", err)
+		}
+	}
+	if !equality.Semantic.DeepEqual(origStatus, &newStatus) {
+		var newErr error
+		obj.Status = newStatus
+		obj, newErr = a.client.UpdateStatus(obj)
+		if err == nil {
+			err = newErr
+		}
+	}
+	return obj, err
+}
+
+type deploymentGeneratingHandler struct {
+	DeploymentGeneratingHandler
+	apply apply.Apply
+	opts  generic.GeneratingHandlerOptions
+	gvk   schema.GroupVersionKind
+	name  string
+}
+
+func (a *deploymentGeneratingHandler) Remove(key string, obj *v1.Deployment) (*v1.Deployment, error) {
+	if obj != nil {
+		return obj, nil
+	}
+
+	obj = &v1.Deployment{}
+	obj.Namespace, obj.Name = kv.RSplit(key, "/")
+	obj.SetGroupVersionKind(a.gvk)
+
+	return nil, generic.ConfigureApplyForObject(a.apply, obj, &a.opts).
+		WithOwner(obj).
+		WithSetID(a.name).
+		ApplyObjects()
+}
+
+func (a *deploymentGeneratingHandler) Handle(obj *v1.Deployment, status v1.DeploymentStatus) (v1.DeploymentStatus, error) {
+	objs, newStatus, err := a.DeploymentGeneratingHandler(obj, status)
+	if err != nil {
+		return newStatus, err
+	}
+
+	return newStatus, generic.ConfigureApplyForObject(a.apply, obj, &a.opts).
+		WithOwner(obj).
+		WithSetID(a.name).
+		ApplyObjects(objs...)
 }

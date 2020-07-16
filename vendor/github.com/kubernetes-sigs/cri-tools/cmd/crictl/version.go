@@ -20,27 +20,30 @@ import (
 	"fmt"
 
 	"github.com/sirupsen/logrus"
-	"github.com/urfave/cli"
+	"github.com/urfave/cli/v2"
 	"golang.org/x/net/context"
-	pb "k8s.io/kubernetes/pkg/kubelet/apis/cri/runtime/v1alpha2"
+	pb "k8s.io/cri-api/pkg/apis/runtime/v1alpha2"
 )
 
 const (
 	criClientVersion = "v1alpha2"
 )
 
-var runtimeVersionCommand = cli.Command{
+var runtimeVersionCommand = &cli.Command{
 	Name:  "version",
 	Usage: "Display runtime version information",
 	Action: func(context *cli.Context) error {
-		err := Version(runtimeClient, criClientVersion)
+		runtimeClient, runtimeConn, err := getRuntimeClient(context)
+		if err != nil {
+			return err
+		}
+		defer closeConnection(context, runtimeConn)
+		err = Version(runtimeClient, criClientVersion)
 		if err != nil {
 			return fmt.Errorf("getting the runtime version failed: %v", err)
 		}
 		return nil
 	},
-	Before: getRuntimeClient,
-	After:  closeConnection,
 }
 
 // Version sends a VersionRequest to the server, and parses the returned VersionResponse.

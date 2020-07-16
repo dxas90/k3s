@@ -10,6 +10,7 @@ import (
 	"io/ioutil"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
@@ -21,8 +22,10 @@ import (
 	"github.com/rancher/wrangler/pkg/objectset"
 	"github.com/sirupsen/logrus"
 	"k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	yamlDecoder "k8s.io/apimachinery/pkg/util/yaml"
 )
 
@@ -31,12 +34,14 @@ const (
 	startKey = "_start_"
 )
 
-func WatchFiles(ctx context.Context, apply apply.Apply, addons v1.AddonController, bases ...string) error {
+func WatchFiles(ctx context.Context, apply apply.Apply, addons v1.AddonController, disables map[string]bool, bases ...string) error {
 	w := &watcher{
 		apply:      apply,
 		addonCache: addons.Cache(),
 		addons:     addons,
 		bases:      bases,
+		disables:   disables,
+		modTime:    map[string]time.Time{},
 	}
 
 	addons.Enqueue("", startKey)
@@ -55,6 +60,8 @@ type watcher struct {
 	addonCache v1.AddonCache
 	addons     v1.AddonClient
 	bases      []string
+	disables   map[string]bool
+	modTime    map[string]time.Time
 }
 
 func (w *watcher) start(ctx context.Context) {
@@ -79,34 +86,53 @@ func (w *watcher) listFiles(force bool) error {
 		if err := w.listFilesIn(base, force); err != nil {
 			errs = append(errs, err)
 		}
-
 	}
 	return merr.NewErrors(errs...)
 }
 
 func (w *watcher) listFilesIn(base string, force bool) error {
-	files, err := ioutil.ReadDir(base)
-	if os.IsNotExist(err) {
+	files := map[string]os.FileInfo{}
+	if err := filepath.Walk(base, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		files[path] = info
 		return nil
-	} else if err != nil {
+	}); err != nil {
 		return err
 	}
 
 	skips := map[string]bool{}
-	for _, file := range files {
+	keys := make([]string, len(files))
+	keyIndex := 0
+	for path, file := range files {
 		if strings.HasSuffix(file.Name(), ".skip") {
 			skips[strings.TrimSuffix(file.Name(), ".skip")] = true
 		}
+		keys[keyIndex] = path
+		keyIndex++
 	}
+	sort.Strings(keys)
 
 	var errs []error
-	for _, file := range files {
-		if skipFile(file.Name(), skips) {
+	for _, path := range keys {
+		if shouldDisableService(base, path, w.disables) {
+			if err := w.delete(path); err != nil {
+				errs = append(errs, errors2.Wrapf(err, "failed to delete %s", path))
+			}
 			continue
 		}
-		p := filepath.Join(base, file.Name())
-		if err := w.deploy(p, !force); err != nil {
-			errs = append(errs, errors2.Wrapf(err, "failed to process %s", p))
+		if skipFile(files[path].Name(), skips) {
+			continue
+		}
+		modTime := files[path].ModTime()
+		if !force && modTime.Equal(w.modTime[path]) {
+			continue
+		}
+		if err := w.deploy(path, !force); err != nil {
+			errs = append(errs, errors2.Wrapf(err, "failed to process %s", path))
+		} else {
+			w.modTime[path] = modTime
 		}
 	}
 
@@ -151,6 +177,39 @@ func (w *watcher) deploy(path string, compareChecksum bool) error {
 
 	_, err = w.addons.Update(&addon)
 	return err
+}
+
+func (w *watcher) delete(path string) error {
+	name := name(path)
+	addon, err := w.addon(name)
+	if err != nil {
+		return err
+	}
+
+	// ensure that the addon is completely removed before deleting the objectSet,
+	// so return when err == nil, otherwise pods may get stuck terminating
+	if err := w.addons.Delete(addon.Namespace, addon.Name, &metav1.DeleteOptions{}); err == nil || !errors.IsNotFound(err) {
+		return err
+	}
+
+	content, err := ioutil.ReadFile(path)
+	if err != nil {
+		return err
+	}
+	objectSet, err := objectSet(content)
+	if err != nil {
+		return err
+	}
+	var gvk []schema.GroupVersionKind
+	for k := range objectSet.ObjectsByGVK() {
+		gvk = append(gvk, k)
+	}
+	// apply an empty set with owner & gvk data to delete
+	if err := w.apply.WithOwner(&addon).WithGVK(gvk...).Apply(nil); err != nil {
+		return err
+	}
+
+	return os.Remove(path)
 }
 
 func (w *watcher) addon(name string) (v12.Addon, error) {
@@ -259,4 +318,29 @@ func skipFile(fileName string, skips map[string]bool) bool {
 	default:
 		return true
 	}
+}
+
+func shouldDisableService(base, fileName string, disables map[string]bool) bool {
+	relFile := strings.TrimPrefix(fileName, base)
+	namePath := strings.Split(relFile, string(os.PathSeparator))
+	for i := 1; i < len(namePath); i++ {
+		subPath := filepath.Join(namePath[0:i]...)
+		if disables[subPath] {
+			return true
+		}
+	}
+	switch {
+	case strings.HasSuffix(fileName, ".json"):
+	case strings.HasSuffix(fileName, ".yml"):
+	case strings.HasSuffix(fileName, ".yaml"):
+	default:
+		return false
+	}
+	baseFile := filepath.Base(fileName)
+	suffix := filepath.Ext(baseFile)
+	baseName := strings.TrimSuffix(baseFile, suffix)
+	if disables[baseName] {
+		return true
+	}
+	return false
 }

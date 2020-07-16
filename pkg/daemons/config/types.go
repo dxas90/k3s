@@ -1,6 +1,7 @@
 package config
 
 import (
+	"context"
 	"crypto/tls"
 	"fmt"
 	"net"
@@ -8,20 +9,32 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/rancher/kine/pkg/endpoint"
+	"github.com/rancher/wrangler-api/pkg/generated/controllers/core"
 	"k8s.io/apiserver/pkg/authentication/authenticator"
+)
+
+const (
+	FlannelBackendNone      = "none"
+	FlannelBackendVXLAN     = "vxlan"
+	FlannelBackendHostGW    = "host-gw"
+	FlannelBackendIPSEC     = "ipsec"
+	FlannelBackendWireguard = "wireguard"
 )
 
 type Node struct {
 	Docker                   bool
 	ContainerRuntimeEndpoint string
 	NoFlannel                bool
+	DisableSELinux           bool
+	FlannelBackend           string
 	FlannelConf              string
+	FlannelConfOverride      bool
 	FlannelIface             *net.Interface
 	Containerd               Containerd
 	Images                   string
 	AgentConfig              Agent
 	CACerts                  []byte
-	ServerAddress            string
 	Certificate              *tls.Certificate
 }
 
@@ -36,105 +49,158 @@ type Containerd struct {
 }
 
 type Agent struct {
-	NodeName            string
-	ClientKubeletCert   string
-	ClientKubeletKey    string
-	ClientKubeProxyCert string
-	ClientKubeProxyKey  string
-	ServingKubeletCert  string
-	ServingKubeletKey   string
-	ClusterCIDR         net.IPNet
-	ClusterDNS          net.IP
-	ClusterDomain       string
-	ResolvConf          string
-	RootDir             string
-	KubeConfigNode      string
-	KubeConfigKubelet   string
-	KubeConfigKubeProxy string
-	NodeIP              string
-	RuntimeSocket       string
-	ListenAddress       string
-	ClientCA            string
-	CNIBinDir           string
-	CNIConfDir          string
-	ExtraKubeletArgs    []string
-	ExtraKubeProxyArgs  []string
-	PauseImage          string
-	CNIPlugin           bool
-	NodeTaints          []string
-	NodeLabels          []string
+	PodManifests            string
+	NodeName                string
+	NodeConfigPath          string
+	ServingKubeletCert      string
+	ServingKubeletKey       string
+	ClusterCIDR             net.IPNet
+	ClusterDNS              net.IP
+	ClusterDomain           string
+	ResolvConf              string
+	RootDir                 string
+	KubeConfigKubelet       string
+	KubeConfigKubeProxy     string
+	KubeConfigK3sController string
+	NodeIP                  string
+	NodeExternalIP          string
+	RuntimeSocket           string
+	ListenAddress           string
+	ClientCA                string
+	CNIBinDir               string
+	CNIConfDir              string
+	ExtraKubeletArgs        []string
+	ExtraKubeProxyArgs      []string
+	PauseImage              string
+	CNIPlugin               bool
+	NodeTaints              []string
+	NodeLabels              []string
+	IPSECPSK                string
+	StrongSwanDir           string
+	PrivateRegistry         string
+	DisableCCM              bool
+	DisableNPC              bool
+	DisableKubeProxy        bool
+	Rootless                bool
 }
 
 type Control struct {
-	AdvertisePort         int
-	AdvertiseIP           string
-	ListenPort            int
-	HTTPSPort             int
-	ClusterSecret         string
-	ClusterIPRange        *net.IPNet
-	ServiceIPRange        *net.IPNet
-	ClusterDNS            net.IP
-	ClusterDomain         string
-	NoCoreDNS             bool
-	KubeConfigOutput      string
-	KubeConfigMode        string
-	DataDir               string
-	Skips                 []string
-	BootstrapType         string
-	StorageBackend        string
-	StorageEndpoint       string
-	StorageCAFile         string
-	StorageCertFile       string
-	StorageKeyFile        string
-	NoScheduler           bool
-	ExtraAPIArgs          []string
-	ExtraControllerArgs   []string
-	ExtraSchedulerAPIArgs []string
-	NoLeaderElect         bool
+	AdvertisePort int
+	AdvertiseIP   string
+	// The port which kubectl clients can access k8s
+	HTTPSPort int
+	// The port which custom k3s API runs on
+	SupervisorPort int
+	// The port which kube-apiserver runs on
+	APIServerPort            int
+	APIServerBindAddress     string
+	AgentToken               string `json:"-"`
+	Token                    string `json:"-"`
+	ClusterIPRange           *net.IPNet
+	ServiceIPRange           *net.IPNet
+	ClusterDNS               net.IP
+	ClusterDomain            string
+	NoCoreDNS                bool
+	KubeConfigOutput         string
+	KubeConfigMode           string
+	DataDir                  string
+	Skips                    map[string]bool
+	Disables                 map[string]bool
+	Datastore                endpoint.Config
+	NoScheduler              bool
+	ExtraAPIArgs             []string
+	ExtraControllerArgs      []string
+	ExtraCloudControllerArgs []string
+	ExtraSchedulerAPIArgs    []string
+	NoLeaderElect            bool
+	JoinURL                  string
+	FlannelBackend           string
+	IPSECPSK                 string
+	DefaultLocalStoragePath  string
+	DisableCCM               bool
+	DisableNPC               bool
+	DisableKubeProxy         bool
+	ClusterInit              bool
+	ClusterReset             bool
+	EncryptSecrets           bool
+	TLSMinVersion            uint16
+	TLSCipherSuites          []uint16
+
+	BindAddress string
+	SANs        []string
 
 	Runtime *ControlRuntime `json:"-"`
 }
 
+type ControlRuntimeBootstrap struct {
+	ETCDServerCA       string
+	ETCDServerCAKey    string
+	ETCDPeerCA         string
+	ETCDPeerCAKey      string
+	ServerCA           string
+	ServerCAKey        string
+	ClientCA           string
+	ClientCAKey        string
+	ServiceKey         string
+	PasswdFile         string
+	RequestHeaderCA    string
+	RequestHeaderCAKey string
+	IPSECKey           string
+	EncryptionConfig   string
+}
+
 type ControlRuntime struct {
+	ControlRuntimeBootstrap
+
+	HTTPBootstrap          bool
+	APIServerReady         <-chan struct{}
+	ETCDReady              <-chan struct{}
+	ClusterControllerStart func(ctx context.Context) error
+
 	ClientKubeAPICert string
 	ClientKubeAPIKey  string
-	ClientCA          string
-	ClientCAKey       string
-	ServerCA          string
-	ServerCAKey       string
-	ServiceKey        string
-	PasswdFile        string
 	NodePasswdFile    string
 
-	KubeConfigAdmin      string
-	KubeConfigController string
-	KubeConfigScheduler  string
-	KubeConfigAPIServer  string
+	KubeConfigAdmin           string
+	KubeConfigController      string
+	KubeConfigScheduler       string
+	KubeConfigAPIServer       string
+	KubeConfigCloudController string
 
 	ServingKubeAPICert string
 	ServingKubeAPIKey  string
-	ClientToken        string
-	NodeToken          string
+	ServingKubeletKey  string
+	ServerToken        string
+	AgentToken         string
 	Handler            http.Handler
 	Tunnel             http.Handler
 	Authenticator      authenticator.Request
 
-	RequestHeaderCA     string
-	RequestHeaderCAKey  string
 	ClientAuthProxyCert string
 	ClientAuthProxyKey  string
 
-	ClientAdminCert      string
-	ClientAdminKey       string
-	ClientControllerCert string
-	ClientControllerKey  string
-	ClientSchedulerCert  string
-	ClientSchedulerKey   string
-	ClientKubeProxyCert  string
-	ClientKubeProxyKey   string
+	ClientAdminCert           string
+	ClientAdminKey            string
+	ClientControllerCert      string
+	ClientControllerKey       string
+	ClientSchedulerCert       string
+	ClientSchedulerKey        string
+	ClientKubeProxyCert       string
+	ClientKubeProxyKey        string
+	ClientKubeletKey          string
+	ClientCloudControllerCert string
+	ClientCloudControllerKey  string
+	ClientK3sControllerCert   string
+	ClientK3sControllerKey    string
 
-	ServingKubeletKey string
-	ClientKubeletKey  string
+	ServerETCDCert           string
+	ServerETCDKey            string
+	PeerServerClientETCDCert string
+	PeerServerClientETCDKey  string
+	ClientETCDCert           string
+	ClientETCDKey            string
+
+	Core *core.Factory
 }
 
 type ArgString []string

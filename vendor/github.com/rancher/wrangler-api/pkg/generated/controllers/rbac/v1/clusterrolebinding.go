@@ -20,6 +20,7 @@ package v1
 
 import (
 	"context"
+	"time"
 
 	"github.com/rancher/wrangler/pkg/generic"
 	v1 "k8s.io/api/rbac/v1"
@@ -40,20 +41,15 @@ import (
 type ClusterRoleBindingHandler func(string, *v1.ClusterRoleBinding) (*v1.ClusterRoleBinding, error)
 
 type ClusterRoleBindingController interface {
+	generic.ControllerMeta
 	ClusterRoleBindingClient
 
 	OnChange(ctx context.Context, name string, sync ClusterRoleBindingHandler)
 	OnRemove(ctx context.Context, name string, sync ClusterRoleBindingHandler)
 	Enqueue(name string)
+	EnqueueAfter(name string, duration time.Duration)
 
 	Cache() ClusterRoleBindingCache
-
-	Informer() cache.SharedIndexInformer
-	GroupVersionKind() schema.GroupVersionKind
-
-	AddGenericHandler(ctx context.Context, name string, handler generic.Handler)
-	AddGenericRemoveHandler(ctx context.Context, name string, handler generic.Handler)
-	Updater() generic.Updater
 }
 
 type ClusterRoleBindingClient interface {
@@ -118,26 +114,21 @@ func (c *clusterRoleBindingController) Updater() generic.Updater {
 	}
 }
 
-func UpdateClusterRoleBindingOnChange(updater generic.Updater, handler ClusterRoleBindingHandler) ClusterRoleBindingHandler {
-	return func(key string, obj *v1.ClusterRoleBinding) (*v1.ClusterRoleBinding, error) {
-		if obj == nil {
-			return handler(key, nil)
-		}
-
-		copyObj := obj.DeepCopy()
-		newObj, err := handler(key, copyObj)
-		if newObj != nil {
-			copyObj = newObj
-		}
-		if obj.ResourceVersion == copyObj.ResourceVersion && !equality.Semantic.DeepEqual(obj, copyObj) {
-			newObj, err := updater(copyObj)
-			if newObj != nil && err == nil {
-				copyObj = newObj.(*v1.ClusterRoleBinding)
-			}
-		}
-
-		return copyObj, err
+func UpdateClusterRoleBindingDeepCopyOnChange(client ClusterRoleBindingClient, obj *v1.ClusterRoleBinding, handler func(obj *v1.ClusterRoleBinding) (*v1.ClusterRoleBinding, error)) (*v1.ClusterRoleBinding, error) {
+	if obj == nil {
+		return obj, nil
 	}
+
+	copyObj := obj.DeepCopy()
+	newObj, err := handler(copyObj)
+	if newObj != nil {
+		copyObj = newObj
+	}
+	if obj.ResourceVersion == copyObj.ResourceVersion && !equality.Semantic.DeepEqual(obj, copyObj) {
+		return client.Update(copyObj)
+	}
+
+	return copyObj, err
 }
 
 func (c *clusterRoleBindingController) AddGenericHandler(ctx context.Context, name string, handler generic.Handler) {
@@ -162,6 +153,10 @@ func (c *clusterRoleBindingController) Enqueue(name string) {
 	c.controllerManager.Enqueue(c.gvk, c.informer.Informer(), "", name)
 }
 
+func (c *clusterRoleBindingController) EnqueueAfter(name string, duration time.Duration) {
+	c.controllerManager.EnqueueAfter(c.gvk, c.informer.Informer(), "", name, duration)
+}
+
 func (c *clusterRoleBindingController) Informer() cache.SharedIndexInformer {
 	return c.informer.Informer()
 }
@@ -178,31 +173,34 @@ func (c *clusterRoleBindingController) Cache() ClusterRoleBindingCache {
 }
 
 func (c *clusterRoleBindingController) Create(obj *v1.ClusterRoleBinding) (*v1.ClusterRoleBinding, error) {
-	return c.clientGetter.ClusterRoleBindings().Create(obj)
+	return c.clientGetter.ClusterRoleBindings().Create(context.TODO(), obj, metav1.CreateOptions{})
 }
 
 func (c *clusterRoleBindingController) Update(obj *v1.ClusterRoleBinding) (*v1.ClusterRoleBinding, error) {
-	return c.clientGetter.ClusterRoleBindings().Update(obj)
+	return c.clientGetter.ClusterRoleBindings().Update(context.TODO(), obj, metav1.UpdateOptions{})
 }
 
 func (c *clusterRoleBindingController) Delete(name string, options *metav1.DeleteOptions) error {
-	return c.clientGetter.ClusterRoleBindings().Delete(name, options)
+	if options == nil {
+		options = &metav1.DeleteOptions{}
+	}
+	return c.clientGetter.ClusterRoleBindings().Delete(context.TODO(), name, *options)
 }
 
 func (c *clusterRoleBindingController) Get(name string, options metav1.GetOptions) (*v1.ClusterRoleBinding, error) {
-	return c.clientGetter.ClusterRoleBindings().Get(name, options)
+	return c.clientGetter.ClusterRoleBindings().Get(context.TODO(), name, options)
 }
 
 func (c *clusterRoleBindingController) List(opts metav1.ListOptions) (*v1.ClusterRoleBindingList, error) {
-	return c.clientGetter.ClusterRoleBindings().List(opts)
+	return c.clientGetter.ClusterRoleBindings().List(context.TODO(), opts)
 }
 
 func (c *clusterRoleBindingController) Watch(opts metav1.ListOptions) (watch.Interface, error) {
-	return c.clientGetter.ClusterRoleBindings().Watch(opts)
+	return c.clientGetter.ClusterRoleBindings().Watch(context.TODO(), opts)
 }
 
 func (c *clusterRoleBindingController) Patch(name string, pt types.PatchType, data []byte, subresources ...string) (result *v1.ClusterRoleBinding, err error) {
-	return c.clientGetter.ClusterRoleBindings().Patch(name, pt, data, subresources...)
+	return c.clientGetter.ClusterRoleBindings().Patch(context.TODO(), name, pt, data, metav1.PatchOptions{}, subresources...)
 }
 
 type clusterRoleBindingCache struct {
@@ -231,6 +229,7 @@ func (c *clusterRoleBindingCache) GetByIndex(indexName, key string) (result []*v
 	if err != nil {
 		return nil, err
 	}
+	result = make([]*v1.ClusterRoleBinding, 0, len(objs))
 	for _, obj := range objs {
 		result = append(result, obj.(*v1.ClusterRoleBinding))
 	}

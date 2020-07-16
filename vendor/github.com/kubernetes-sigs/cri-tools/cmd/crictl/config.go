@@ -20,10 +20,11 @@ import (
 	"fmt"
 	"io/ioutil"
 	"os"
+	gofilepath "path/filepath"
 	"strconv"
 
 	"github.com/sirupsen/logrus"
-	"github.com/urfave/cli"
+	"github.com/urfave/cli/v2"
 	"gopkg.in/yaml.v2"
 )
 
@@ -56,23 +57,25 @@ func writeConfig(c *Config, filepath string) error {
 	if err != nil {
 		return err
 	}
+	if err := os.MkdirAll(gofilepath.Dir(filepath), 0755); err != nil {
+		return err
+	}
 	return ioutil.WriteFile(filepath, data, 0644)
 }
 
-var configCommand = cli.Command{
+var configCommand = &cli.Command{
 	Name:                   "config",
 	Usage:                  "Get and set crictl options",
 	ArgsUsage:              "[<options>]",
-	SkipArgReorder:         true,
 	UseShortOptionHandling: true,
 	Flags: []cli.Flag{
-		cli.StringFlag{
+		&cli.StringFlag{
 			Name:  "get",
 			Usage: "get value: name",
 		},
 	},
 	Action: func(context *cli.Context) error {
-		configFile := context.GlobalString("config")
+		configFile := context.String("config")
 		if _, err := os.Stat(configFile); err != nil {
 			if err := writeConfig(nil, configFile); err != nil {
 				return err
@@ -119,6 +122,8 @@ var configCommand = cli.Command{
 			var debug bool
 			if value == "true" {
 				debug = true
+			} else if value == "false" {
+				debug = false
 			} else {
 				logrus.Fatal("use true|false for debug")
 			}

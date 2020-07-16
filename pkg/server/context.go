@@ -12,9 +12,9 @@ import (
 	"github.com/rancher/wrangler/pkg/apply"
 	"github.com/rancher/wrangler/pkg/crd"
 	"github.com/rancher/wrangler/pkg/start"
+	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
-	"k8s.io/kubernetes/staging/src/k8s.io/client-go/kubernetes"
-	"k8s.io/kubernetes/staging/src/k8s.io/client-go/tools/clientcmd"
+	"k8s.io/client-go/tools/clientcmd"
 )
 
 type Context struct {
@@ -51,7 +51,7 @@ func newContext(ctx context.Context, cfg string) (*Context, error) {
 		Apps:  apps.NewFactoryFromConfigOrDie(restConfig),
 		Batch: batch.NewFactoryFromConfigOrDie(restConfig),
 		Core:  core.NewFactoryFromConfigOrDie(restConfig),
-		Apply: apply.New(k8s, apply.NewClientFactory(restConfig)),
+		Apply: apply.New(k8s, apply.NewClientFactory(restConfig)).WithDynamicLookup(),
 	}, nil
 }
 
@@ -62,7 +62,6 @@ func crds(ctx context.Context, config *rest.Config) error {
 	}
 
 	factory.BatchCreateCRDs(ctx, crd.NamespacedTypes(
-		"ListenerConfig.k3s.cattle.io/v1",
 		"Addon.k3s.cattle.io/v1",
 		"HelmChart.helm.cattle.io/v1")...)
 
